@@ -34,8 +34,14 @@ const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const ALIGN: u64 = 512;
 const SLAB_BYTES: u64 = 512 << 20;
-/// 1 バッチに積む最大コマンド数（超えたら submit する。待たない）
-const MAX_BATCH: u32 = 4096;
+/// 1 バッチに積む最大コマンド数（超えたら submit する。待たない）。
+/// 1 回の submit が長時間走ると、ドライバのハング検出（Linux amdgpu: 約 10 秒、Windows TDR: 約 2 秒）で
+/// デバイスが失われる。遅い GPU（RX 550 など）で 4096 個を積むと超えるので、小さめにする。VKRT_MAX_BATCH で上書きできる。
+const DEFAULT_MAX_BATCH: u32 = 64;
+fn max_batch() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("VKRT_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_BATCH))
+}
 /// これ以上の要求は専用バッファにする（解放時にドライバへ返す）。
 const DEDICATED_MIN: u64 = 256 << 20;
 
@@ -69,6 +75,8 @@ struct Staging {
     memory: vk::DeviceMemory,
     ptr: *mut u8,
     size: u64,
+    /// HOST_COHERENT でなければ、読み出しの前に invalidate が要る
+    coherent: bool,
 }
 
 struct Runtime {
@@ -95,6 +103,8 @@ struct Runtime {
     slabs: BTreeMap<u64, Slab>,
     blocks: BTreeMap<u64, Block>,
     staging: Staging,
+    /// GPU -> ホストの読み出し専用（HOST_CACHED 優先）。書き込み結合メモリを CPU から読むと約 0.2GB/s まで落ちる（RX 550 で実測）
+    readback: Staging,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     mem_device_local: u32,
     max_alloc: u64,
@@ -248,8 +258,10 @@ impl Runtime {
             let mut q_bf = Bf16Features::default();
             let mut q13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut q12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut q11 = vk::PhysicalDeviceVulkan11Features::default();
+            let mut base_feats = vk::PhysicalDeviceFeatures::default();
             {
-                let mut q2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut q13).push_next(&mut q12);
+                let mut q2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut q13).push_next(&mut q12).push_next(&mut q11);
                 if has_ext(ext_coop) {
                     q2 = q2.push_next(&mut q_coop);
                 }
@@ -257,13 +269,33 @@ impl Runtime {
                     q2 = q2.push_next(&mut q_bf);
                 }
                 instance.get_physical_device_features2(pd, &mut q2);
+                base_feats = q2.features;
             }
+            // 必須機能。足りなければ、黙って誤動作せず理由を返す。
+            let required = [
+                (q12.buffer_device_address, "bufferDeviceAddress"),
+                (q12.shader_int8, "shaderInt8"),
+                (q12.storage_buffer8_bit_access, "storageBuffer8BitAccess"),
+                (q11.storage_buffer16_bit_access, "storageBuffer16BitAccess"),
+                (base_feats.shader_int64, "shaderInt64"),
+                (base_feats.shader_int16, "shaderInt16"),
+            ];
+            let missing: Vec<&str> = required.iter().filter(|(v, _)| *v == 0).map(|(_, n)| *n).collect();
+            if !missing.is_empty() {
+                return Err(format!("{device_name} は vkrt の必須機能に対応していません: {missing:?}"));
+            }
+            // fp16 演算は任意（RX 550 / GTX 1060 には無い）。fp16 のデータ型は pack/unpackHalf2x16 で扱うので不要。
+            // VKRT_MASK_FP16 / VKRT_MASK_COOP は、古い GPU の挙動を新しい GPU 上で模擬するためのスイッチ。
+            let fp16_ok = q12.shader_float16 != 0 && std::env::var_os("VKRT_MASK_FP16").is_none();
+            let mask_coop = std::env::var_os("VKRT_MASK_COOP").is_some();
             let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
             {
                 let mut pp = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
                 instance.get_physical_device_properties2(pd, &mut pp);
             }
-            let coop_ok = has_ext(ext_coop)
+            let coop_ok = !mask_coop
+                && fp16_ok  // 協調行列カーネル(bf16 版も)は Float16 capability を宣言する
+                && has_ext(ext_coop)
                 && q_coop.cooperative_matrix != 0
                 && q13.subgroup_size_control != 0
                 && q12.vulkan_memory_model != 0
@@ -272,7 +304,7 @@ impl Runtime {
                 && sg.max_subgroup_size >= COOP_SUBGROUP
                 && sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
             let bf16_ok = coop_ok && has_ext(ext_bf16) && q_bf.shader_bfloat16_type != 0 && q_bf.shader_bfloat16_cooperative_matrix != 0;
-            let coop_caps: u32 = if coop_ok { 1 | if bf16_ok { 2 } else { 0 } } else { 0 };
+                        let coop_caps: u32 = if coop_ok { 1 | if bf16_ok { 2 } else { 0 } } else { 0 };
             let mut dev_ext_ptrs: Vec<*const c_char> = vec![];
             if coop_ok {
                 dev_ext_ptrs.push(ext_coop.as_ptr());
@@ -289,7 +321,7 @@ impl Runtime {
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
                 .buffer_device_address(true)
-                .shader_float16(true)
+                .shader_float16(coop_ok)  // 協調行列カーネルだけが使う
                 .shader_int8(true)
                 .storage_buffer8_bit_access(true)
                 .vulkan_memory_model(coop_ok); // 協調行列シェーダ(GL_KHR_memory_scope_semantics)が宣言する
@@ -354,6 +386,29 @@ impl Runtime {
             device.bind_buffer_memory(sbuf, smem, 0).map_err(vkerr("ステージング bind"))?;
             let sptr = device.map_memory(smem, 0, STAGING_BYTES, vk::MemoryMapFlags::empty()).map_err(vkerr("map"))? as *mut u8;
 
+            // 読み出し専用ステージング。CPU から読むので HOST_CACHED を優先する（無ければアップロード用と同じ種類）。
+            let rbuf = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(STAGING_BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST),
+                    None,
+                )
+                .map_err(vkerr("読み出しバッファ"))?;
+            let rreq = device.get_buffer_memory_requirements(rbuf);
+            let hv = vk::MemoryPropertyFlags::HOST_VISIBLE;
+            let (rtype, rcoherent) = [
+                hv | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
+                hv | vk::MemoryPropertyFlags::HOST_CACHED,
+                hv | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ]
+            .iter()
+            .find_map(|&f| find_memory_type(&mem_props, rreq.memory_type_bits, f).map(|t| (t, f.contains(vk::MemoryPropertyFlags::HOST_COHERENT))))
+            .ok_or("読み出し用のホスト可視メモリがありません")?;
+            let rmem = device
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(rreq.size).memory_type_index(rtype), None)
+                .map_err(vkerr("読み出しメモリ"))?;
+            device.bind_buffer_memory(rbuf, rmem, 0).map_err(vkerr("読み出し bind"))?;
+            let rptr = device.map_memory(rmem, 0, STAGING_BYTES, vk::MemoryMapFlags::empty()).map_err(vkerr("map"))? as *mut u8;
+
             // パイプライン（descriptor 無し・push constant のみ。バッファは push constant 内のアドレスで渡す）
             let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(PUSH_MAX)];
             let layout = device
@@ -389,7 +444,8 @@ impl Runtime {
                 kernels,
                 slabs: BTreeMap::new(),
                 blocks: BTreeMap::new(),
-                staging: Staging { buffer: sbuf, memory: smem, ptr: sptr, size: STAGING_BYTES },
+                staging: Staging { buffer: sbuf, memory: smem, ptr: sptr, size: STAGING_BYTES, coherent: true },
+                readback: Staging { buffer: rbuf, memory: rmem, ptr: rptr, size: STAGING_BYTES, coherent: rcoherent },
                 mem_props,
                 mem_device_local,
                 max_alloc,
@@ -477,7 +533,7 @@ impl Runtime {
         f(&self.device, cmd);
         self.barrier(cmd);
         self.pending += 1;
-        if self.pending >= MAX_BATCH {
+        if self.pending >= max_batch() {
             self.flush(false)?;
         }
         Ok(())
@@ -675,12 +731,18 @@ impl Runtime {
         let (buf, off) = self.resolve(src, n)?;
         let mut done = 0u64;
         while done < n {
-            let chunk = (n - done).min(self.staging.size);
-            let (sb, o) = (self.staging.buffer, off + done);
+            let chunk = (n - done).min(self.readback.size);
+            let (sb, o) = (self.readback.buffer, off + done);
             self.submit_sync(|d, c| unsafe {
                 d.cmd_copy_buffer(c, buf, sb, &[vk::BufferCopy::default().src_offset(o).dst_offset(0).size(chunk)]);
             })?;
-            unsafe { std::ptr::copy_nonoverlapping(self.staging.ptr, dst.add(done as usize), chunk as usize) };
+            unsafe {
+                if !self.readback.coherent {
+                    let range = vk::MappedMemoryRange::default().memory(self.readback.memory).offset(0).size(vk::WHOLE_SIZE);
+                    self.device.invalidate_mapped_memory_ranges(&[range]).map_err(vkerr("invalidate"))?;
+                }
+                std::ptr::copy_nonoverlapping(self.readback.ptr, dst.add(done as usize), chunk as usize);
+            }
             done += chunk;
         }
         Ok(())

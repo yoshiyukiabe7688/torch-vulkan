@@ -12,6 +12,7 @@
 #include <ATen/ops/unfold_native.h>
 #include <ATen/ops/view_native.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/CPUAllocator.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/util/Exception.h>
 #include <torch/extension.h>
@@ -191,6 +192,9 @@ struct VulkanHooks final : public at::PrivateUse1HooksInterface {
   bool hasPrimaryContext(c10::DeviceIndex) const override { return true; }
   at::Device getDeviceFromPtr(void*) const override { return c10::Device(kDev, 0); }
   bool isPinnedPtr(const void*) const override { return false; }
+  // non_blocking の D2H コピー（ブロックスワップが使う）で PyTorch が問い合わせる。ピン留めは通常のホストメモリで代用する
+  // （vk の転送は同期的なので、ページロックの有無は結果に影響しない）。
+  at::Allocator* getPinnedMemoryAllocator() const override { return c10::GetCPUAllocator(); }
   // resize_ などでストレージを拡張するときに呼ばれる。
   void resizePrivateUse1Bytes(const c10::Storage& storage, size_t newsize) const override {
     auto* impl = storage.unsafeGetStorageImpl();

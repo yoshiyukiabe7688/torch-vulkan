@@ -108,8 +108,8 @@ def variants():
     return out
 
 
-def compile_one(name, expr, a, b, c, o):
-    defs = [f"-DOP_EXPR={expr}", f"-DO_KIND={KIND[o]}"]
+def compile_one(name, expr, a, b, c, o, fast=False):
+    defs = [f"-DOP_EXPR={expr}", f"-DO_KIND={KIND[o]}"] + (["-DFAST1D"] if fast else [])
     for tag, dt in (("A", a), ("B", b), ("C", c)):
         defs.append(f"-D{tag}_KIND={KIND[dt] if dt else 0}")
         if dt:
@@ -146,6 +146,9 @@ def main():
     for v in variants():
         compile_one(*v)
         entries.append((v[0], PUSH_SIZE))
+        fast_name = "ew1_" + v[0][3:]  # 連続メモリ(次元結合後 1 次元)の高速経路。名前の接頭辞 ew_ -> ew1_
+        compile_one(fast_name, *v[1:], fast=True)
+        entries.append((fast_name, PUSH_SIZE))
     for dt in FLOATS:
         entries.append((compile_mm(dt), MM_PUSH_SIZE))
     for dt in ("bf16", "f16"):  # 協調行列版（vkrt が対応を判定し、非対応デバイスでは使われない）
