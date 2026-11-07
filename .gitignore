@@ -7,3 +7,4 @@ __pycache__/
 *.obj
 probe_out.txt
 anima_vk_*.txt
+*.dll
