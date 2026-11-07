@@ -170,10 +170,10 @@ fn freed_neighbours_are_coalesced_and_data_is_isolated() {
 #[test]
 fn empty_cache_returns_idle_slabs_and_large_blocks_are_dedicated() {
     let _g = init();
-    let big = vkrt_alloc(100 << 20); // 専用スラブ
+    let big = vkrt_alloc(300 << 20); // 専用スラブ
     assert!(big != 0);
     let reserved = vkrt_reserved_bytes();
-    assert!(reserved >= 100 << 20);
+    assert!(reserved >= 300 << 20);
     vkrt_free(big); // 専用スラブは解放時にドライバへ返る
     assert!(vkrt_reserved_bytes() < reserved);
     let small = vkrt_alloc(1024);

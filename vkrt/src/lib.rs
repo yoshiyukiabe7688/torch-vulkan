@@ -33,9 +33,11 @@ const PUSH_MAX: u32 = 256; // maxPushConstantsSize（AMD gfx1201 実測 256。�
 const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const ALIGN: u64 = 512;
-const SLAB_BYTES: u64 = 256 << 20;
+const SLAB_BYTES: u64 = 512 << 20;
+/// 1 バッチに積む最大コマンド数（超えたら submit する。待たない）
+const MAX_BATCH: u32 = 4096;
 /// これ以上の要求は専用バッファにする（解放時にドライバへ返す）。
-const DEDICATED_MIN: u64 = 64 << 20;
+const DEDICATED_MIN: u64 = 256 << 20;
 
 /// デバイスメモリ 1 枚（1 つの VkBuffer）。内部をサブアロケートする。
 struct Slab {
@@ -75,8 +77,19 @@ struct Runtime {
     device: Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
+    /// 同期転送(upload/download)用
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// バッチ実行用(2 本を交互に使う): 記録中のものを submit したら、もう 1 本に記録しながら GPU が先のバッチを実行する
+    bcmd: [vk::CommandBuffer; 2],
+    bfence: [vk::Fence; 2],
+    bflight: [bool; 2],
+    bcur: usize,
+    recording: bool,
+    pending: u32,
+    last_pipeline: Option<vk::Pipeline>,
+    /// 協調行列カーネルが使えるか（f16 / bf16）。bit0=f16, bit1=bf16
+    coop_caps: u32,
     layout: vk::PipelineLayout,
     kernels: Vec<Kernel>,
     slabs: BTreeMap<u64, Slab>,
@@ -98,6 +111,12 @@ static STATS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 fn stat_add(i: usize, v: u64) {
     STATS[i].fetch_add(v as usize, Ordering::Relaxed);
 }
+/// カーネル別の GPU 実行時間(ns, 回数)。VKRT_PROFILE 設定時のみ有効（1 dispatch ごとに完了を待つので遅くなる）。
+static PROFILE: Mutex<BTreeMap<&'static str, (u64, u64)>> = Mutex::new(BTreeMap::new());
+static PROFILE_ON: OnceLock<bool> = OnceLock::new();
+fn profile_on() -> bool {
+    *PROFILE_ON.get_or_init(|| std::env::var_os("VKRT_PROFILE").is_some())
+}
 static RT: OnceLock<Mutex<Runtime>> = OnceLock::new();
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -114,6 +133,36 @@ unsafe extern "system" fn debug_callback(
     eprintln!("[vkrt validation {severity:?}] {msg}");
     vk::FALSE
 }
+
+/// VK_KHR_shader_bfloat16 の機能構造体（ash 0.38 には無いので自前で定義する）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Bf16Features {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    shader_bfloat16_type: vk::Bool32,
+    shader_bfloat16_dot_product: vk::Bool32,
+    shader_bfloat16_cooperative_matrix: vk::Bool32,
+}
+impl Default for Bf16Features {
+    fn default() -> Self {
+        Bf16Features {
+            s_type: vk::StructureType::from_raw(1000141000), // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR
+            p_next: std::ptr::null_mut(),
+            shader_bfloat16_type: 0,
+            shader_bfloat16_dot_product: 0,
+            shader_bfloat16_cooperative_matrix: 0,
+        }
+    }
+}
+unsafe impl vk::TaggedStructure for Bf16Features {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1000141000);
+}
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for Bf16Features {}
+unsafe impl vk::ExtendsDeviceCreateInfo for Bf16Features {}
+
+/// 協調行列カーネルが使うサブグループサイズ（mm_coop.comp.in は 32 を前提に workgroup=128 → 4 サブグループ）
+const COOP_SUBGROUP: u32 = 32;
 
 type R<T> = Result<T, String>;
 
@@ -190,18 +239,72 @@ impl Runtime {
                 .ok_or("compute キューがありません")? as u32;
             let prio = [1.0f32];
             let qinfo = [vk::DeviceQueueCreateInfo::default().queue_family_index(qfamily).queue_priorities(&prio)];
+            // 協調行列(+bf16)の対応を判定する。サブグループサイズを 32 に固定できることも必須（固定できないなら使わない）。
+            let dev_exts = instance.enumerate_device_extension_properties(pd).map_err(vkerr("デバイス拡張列挙"))?;
+            let has_ext = |n: &CStr| dev_exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|x| x == n));
+            let ext_coop = c"VK_KHR_cooperative_matrix";
+            let ext_bf16 = c"VK_KHR_shader_bfloat16";
+            let mut q_coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+            let mut q_bf = Bf16Features::default();
+            let mut q13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut q12 = vk::PhysicalDeviceVulkan12Features::default();
+            {
+                let mut q2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut q13).push_next(&mut q12);
+                if has_ext(ext_coop) {
+                    q2 = q2.push_next(&mut q_coop);
+                }
+                if has_ext(ext_bf16) {
+                    q2 = q2.push_next(&mut q_bf);
+                }
+                instance.get_physical_device_features2(pd, &mut q2);
+            }
+            let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            {
+                let mut pp = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
+                instance.get_physical_device_properties2(pd, &mut pp);
+            }
+            let coop_ok = has_ext(ext_coop)
+                && q_coop.cooperative_matrix != 0
+                && q13.subgroup_size_control != 0
+                && q12.vulkan_memory_model != 0
+                && q13.compute_full_subgroups != 0
+                && sg.min_subgroup_size <= COOP_SUBGROUP
+                && sg.max_subgroup_size >= COOP_SUBGROUP
+                && sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
+            let bf16_ok = coop_ok && has_ext(ext_bf16) && q_bf.shader_bfloat16_type != 0 && q_bf.shader_bfloat16_cooperative_matrix != 0;
+            let coop_caps: u32 = if coop_ok { 1 | if bf16_ok { 2 } else { 0 } } else { 0 };
+            let mut dev_ext_ptrs: Vec<*const c_char> = vec![];
+            if coop_ok {
+                dev_ext_ptrs.push(ext_coop.as_ptr());
+            }
+            if bf16_ok {
+                dev_ext_ptrs.push(ext_bf16.as_ptr());
+            }
+            let mut e_coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+            let mut e_bf = Bf16Features::default();
+            e_bf.shader_bfloat16_type = 1;
+            e_bf.shader_bfloat16_cooperative_matrix = 1;
+            let mut e13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true);
+
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
                 .buffer_device_address(true)
                 .shader_float16(true)
                 .shader_int8(true)
-                .storage_buffer8_bit_access(true);
+                .storage_buffer8_bit_access(true)
+                .vulkan_memory_model(coop_ok); // 協調行列シェーダ(GL_KHR_memory_scope_semantics)が宣言する
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
                 .features(vk::PhysicalDeviceFeatures::default().shader_int64(true).shader_int16(true))
                 .push_next(&mut f11)
                 .push_next(&mut f12);
+            if coop_ok {
+                f2 = f2.push_next(&mut e13).push_next(&mut e_coop);
+            }
+            if bf16_ok {
+                f2 = f2.push_next(&mut e_bf);
+            }
             let device = instance
-                .create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qinfo).push_next(&mut f2), None)
+                .create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qinfo).enabled_extension_names(&dev_ext_ptrs).push_next(&mut f2), None)
                 .map_err(vkerr("デバイス作成"))?;
             let queue = device.get_device_queue(qfamily, 0);
 
@@ -258,6 +361,14 @@ impl Runtime {
                 .map_err(vkerr("パイプラインレイアウト"))?;
             let kernels = kernel_table().iter().map(|(_, _, push_size)| Kernel { pipeline: None, push_size: *push_size }).collect();
 
+            let bcmds = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2),
+                )
+                .map_err(vkerr("バッチ用コマンドバッファ"))?;
+            let bf0 = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr("フェンス"))?;
+            let bf1 = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr("フェンス"))?;
+
             Ok(Runtime {
                 _entry: entry,
                 instance,
@@ -266,6 +377,14 @@ impl Runtime {
                 pool,
                 cmd,
                 fence,
+                bcmd: [bcmds[0], bcmds[1]],
+                bfence: [bf0, bf1],
+                bflight: [false, false],
+                bcur: 0,
+                recording: false,
+                pending: 0,
+                last_pipeline: None,
+                coop_caps,
                 layout,
                 kernels,
                 slabs: BTreeMap::new(),
@@ -280,8 +399,9 @@ impl Runtime {
         }
     }
 
-    /// 1 回分のコマンドを記録して submit し、完了を待つ。
-    fn submit_sync(&self, record: impl FnOnce(&Device, vk::CommandBuffer)) -> R<()> {
+    /// 1 回分のコマンドを記録して submit し、完了を待つ（upload / download 用）。先に積んだバッチを全部完了させる。
+    fn submit_sync(&mut self, record: impl FnOnce(&Device, vk::CommandBuffer)) -> R<()> {
+        self.flush(true)?;
         unsafe {
             let d = &self.device;
             d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).map_err(vkerr("reset"))?;
@@ -298,6 +418,88 @@ impl Runtime {
             d.reset_fences(&[self.fence]).map_err(vkerr("reset fence"))?;
         }
         Ok(())
+    }
+
+    /// バッチ i の完了を待つ（飛行中でなければ何もしない）。
+    fn wait_batch(&mut self, i: usize) -> R<()> {
+        if self.bflight[i] {
+            let t0 = std::time::Instant::now();
+            unsafe {
+                self.device.wait_for_fences(&[self.bfence[i]], true, u64::MAX).map_err(vkerr("バッチ待ち"))?;
+                self.device.reset_fences(&[self.bfence[i]]).map_err(vkerr("reset fence"))?;
+            }
+            self.bflight[i] = false;
+            stat_add(7, t0.elapsed().as_nanos() as u64);
+        }
+        Ok(())
+    }
+
+    /// 記録中のバッチを submit する。wait が true なら、飛行中の全バッチの完了まで待つ。
+    fn flush(&mut self, wait: bool) -> R<()> {
+        if self.recording {
+            let i = self.bcur;
+            unsafe {
+                self.device.end_command_buffer(self.bcmd[i]).map_err(vkerr("end"))?;
+                let cmds = [self.bcmd[i]];
+                self.device
+                    .queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], self.bfence[i])
+                    .map_err(vkerr("submit"))?;
+            }
+            self.bflight[i] = true;
+            self.recording = false;
+            self.bcur ^= 1;
+        }
+        if wait {
+            self.wait_batch(0)?;
+            self.wait_batch(1)?;
+        }
+        Ok(())
+    }
+
+    /// コマンドを現在のバッチへ記録する（submit も待ちもしない）。コマンド間には全メモリバリアを入れる。
+    fn record(&mut self, f: impl FnOnce(&Device, vk::CommandBuffer)) -> R<()> {
+        if !self.recording {
+            let i = self.bcur;
+            self.wait_batch(i)?; // 2 つ前のバッチがまだ飛行中なら、再利用のために待つ
+            unsafe {
+                self.device.reset_command_buffer(self.bcmd[i], vk::CommandBufferResetFlags::empty()).map_err(vkerr("reset"))?;
+                self.device
+                    .begin_command_buffer(self.bcmd[i], &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                    .map_err(vkerr("begin"))?;
+            }
+            self.recording = true;
+            self.pending = 0;
+            self.last_pipeline = None;
+            // 先に submit したバッチの結果を読めるよう、バッチの先頭にもバリアを置く
+            self.barrier(self.bcmd[i]);
+        }
+        let cmd = self.bcmd[self.bcur];
+        f(&self.device, cmd);
+        self.barrier(cmd);
+        self.pending += 1;
+        if self.pending >= MAX_BATCH {
+            self.flush(false)?;
+        }
+        Ok(())
+    }
+
+    fn barrier(&self, cmd: vk::CommandBuffer) {
+        let mb = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            )];
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &mb,
+                &[],
+                &[],
+            );
+        }
     }
 
     /// 新しいスラブ（1 つの VkBuffer + VkDeviceMemory）を作る。
@@ -398,6 +600,7 @@ impl Runtime {
         slab.used -= blk.size;
         self.live_bytes -= blk.size;
         if slab.dedicated {
+            self.flush(true)?; // 実行中のコマンドが参照しているかもしれないので、破棄前に完了を待つ
             let slab = self.slabs.remove(&base).unwrap();
             unsafe {
                 self.device.destroy_buffer(slab.buffer, None);
@@ -427,6 +630,7 @@ impl Runtime {
 
     /// 完全に空いたスラブをドライバへ返す。返したスラブ数を返す。
     fn empty_cache(&mut self) -> usize {
+        let _ = self.flush(true); // スラブ破棄の前に GPU 完了を待つ
         let empty: Vec<u64> = self.slabs.iter().filter(|(_, s)| s.used == 0).map(|(&b, _)| b).collect();
         for b in &empty {
             let slab = self.slabs.remove(b).unwrap();
@@ -452,7 +656,7 @@ impl Runtime {
         Ok((slab.buffer, addr - sbase))
     }
 
-    fn upload(&self, dst: u64, src: *const u8, n: u64) -> R<()> {
+    fn upload(&mut self, dst: u64, src: *const u8, n: u64) -> R<()> {
         let (buf, off) = self.resolve(dst, n)?;
         let mut done = 0u64;
         while done < n {
@@ -467,7 +671,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn download(&self, dst: *mut u8, src: u64, n: u64) -> R<()> {
+    fn download(&mut self, dst: *mut u8, src: u64, n: u64) -> R<()> {
         let (buf, off) = self.resolve(src, n)?;
         let mut done = 0u64;
         while done < n {
@@ -482,10 +686,10 @@ impl Runtime {
         Ok(())
     }
 
-    fn copy_d2d(&self, dst: u64, src: u64, n: u64) -> R<()> {
+    fn copy_d2d(&mut self, dst: u64, src: u64, n: u64) -> R<()> {
         let (db, doff) = self.resolve(dst, n)?;
         let (sb, soff) = self.resolve(src, n)?;
-        self.submit_sync(|d, c| unsafe {
+        self.record(|d, c| unsafe {
             d.cmd_copy_buffer(c, sb, db, &[vk::BufferCopy::default().src_offset(soff).dst_offset(doff).size(n)]);
         })
     }
@@ -501,8 +705,20 @@ impl Runtime {
                 .device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .map_err(vkerr(name))?;
-            let stage =
+            let is_coop = name.starts_with("mm_coop");
+            if is_coop {
+                let need = if name.ends_with("_bf16") { 2 } else { 1 };
+                if self.coop_caps & need == 0 {
+                    self.device.destroy_shader_module(module, None);
+                    return Err(format!("カーネル {name} はこのデバイスで使えません（協調行列/サブグループサイズ固定が非対応）"));
+                }
+            }
+            let mut req = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(COOP_SUBGROUP);
+            let mut stage =
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            if is_coop {
+                stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req);
+            }
             let r = self.device.create_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)],
@@ -525,11 +741,26 @@ impl Runtime {
         let pipeline = self.ensure_pipeline(idx)?;
         stat_add(4, t_pipe.elapsed().as_nanos() as u64);
         let t0 = std::time::Instant::now();
-        let r = self.submit_sync(|d, c| unsafe {
-            d.cmd_bind_pipeline(c, vk::PipelineBindPoint::COMPUTE, pipeline);
-            d.cmd_push_constants(c, self.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+        let layout = self.layout;
+        let need_bind = self.last_pipeline != Some(pipeline) || !self.recording;
+        let r = self.record(|d, c| unsafe {
+            if need_bind {
+                d.cmd_bind_pipeline(c, vk::PipelineBindPoint::COMPUTE, pipeline);
+            }
+            d.cmd_push_constants(c, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             d.cmd_dispatch(c, gx, gy, gz);
         });
+        self.last_pipeline = Some(pipeline);
+        if profile_on() {
+            let tp = std::time::Instant::now();
+            self.flush(true)?;
+            let ns = tp.elapsed().as_nanos() as u64;
+            let name = kernel_table()[idx].0;
+            let mut m = PROFILE.lock().unwrap();
+            let e = m.entry(name).or_insert((0, 0));
+            e.0 += ns;
+            e.1 += 1;
+        }
         stat_add(0, t0.elapsed().as_nanos() as u64);
         stat_add(1, 1);
         r
@@ -705,7 +936,7 @@ pub unsafe extern "C" fn vkrt_dispatch(kernel: u32, push: *const c_void, push_le
 /// 完了待ち（現状は各操作が同期なので何もしない。バッチ化後に意味を持つ）。
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_synchronize() -> i32 {
-    status(with_rt(|rt| rt.submit_sync(|_, _| {})))
+    status(with_rt(|rt| rt.flush(true)))
 }
 
 /// 検証レイヤが報告したエラー数（`VKRT_VALIDATION` 設定時のみ増える）。
@@ -742,4 +973,33 @@ pub extern "C" fn vkrt_slab_count() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_stat(i: u32) -> u64 {
     STATS.get(i as usize).map(|a| a.load(Ordering::Relaxed) as u64).unwrap_or(0)
+}
+
+/// プロファイル結果（"名前\t合計ms\t回数\n" を合計時間の降順で）を buf へ書く。
+///
+/// # Safety
+/// `buf` は `cap` バイト以上の書き込み可能な領域を指すこと。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vkrt_profile_dump(buf: *mut c_char, cap: usize) -> usize {
+    let m = PROFILE.lock().unwrap();
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let mut out = String::new();
+    for (name, (ns, n)) in v {
+        out.push_str(&format!("{name}\t{:.3}\t{n}\n", *ns as f64 * 1e-6));
+    }
+    if !buf.is_null() && cap > 0 {
+        let k = out.len().min(cap - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, k);
+            *buf.add(k) = 0;
+        }
+    }
+    out.len()
+}
+
+/// 使える協調行列カーネルのビットマスク: bit0=f16, bit1=bf16（サブグループサイズ 32 固定が必要）。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_coop_caps() -> u32 {
+    report(with_rt(|rt| Ok(rt.coop_caps)))
 }

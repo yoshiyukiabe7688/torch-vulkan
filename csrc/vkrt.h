@@ -23,4 +23,6 @@ size_t vkrt_live_blocks();
 size_t vkrt_slab_count();
 size_t vkrt_validation_errors();
 uint64_t vkrt_stat(uint32_t i);
+size_t vkrt_profile_dump(char* buf, size_t cap);
+uint32_t vkrt_coop_caps();
 }

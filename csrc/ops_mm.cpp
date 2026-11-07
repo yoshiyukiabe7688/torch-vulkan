@@ -2,7 +2,10 @@
 // 転置・スライスなどの任意ストライドはコピー無しで直接読む。条件外（dtype が f32/bf16/f16 で揃っていない等）は CPU へ戻す。
 #include <ATen/Operators.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <optional>
 #include <string>
 
@@ -24,6 +27,19 @@ struct MmPush {
   uint32_t has_bias, pad;
 };
 static_assert(sizeof(MmPush) == 112, "MmPush は mm.comp.in の push constant と同じ 112 バイトであること");
+
+std::atomic<bool>& coop_enabled() {
+  static std::atomic<bool> v{std::getenv("VKT_NO_COOP") == nullptr};
+  return v;
+}
+
+uint32_t coop_caps_cached() {
+  static uint32_t caps = [] {
+    ensure_init();
+    return vkrt_coop_caps();
+  }();
+  return caps;
+}
 
 const char* mm_kind(at::ScalarType t) {
   switch (t) {
@@ -102,7 +118,47 @@ std::optional<at::Tensor> try_gemm(const at::Tensor& a, const at::Tensor& b, con
   P.has_bias = use_bias ? 1 : 0;
 
   uint32_t gx = (uint32_t)((N + 63) / 64), gy = (uint32_t)((M + 63) / 64), gz = (uint32_t)batch;
-  vk_check(vkrt_dispatch((uint32_t)kernel_index(std::string("mm_") + kind), &P, sizeof(P), gx, gy, gz), "dispatch mm");
+  // bf16 / f16 で、デバイスが協調行列に対応し、十分大きい行列なら協調行列版を使う（それ以外は従来のタイル型）。
+  // 協調行列版のタイルは 64x64 / 128 スレッド。これは mm.comp.in(256 スレッド)とは別のカーネルなので、グリッドは同じ。
+  bool use_coop = false;
+  if (coop_enabled().load() && M >= 32 && N >= 32 && K >= 32) {
+    uint32_t caps = coop_caps_cached();
+    use_coop = (a.scalar_type() == at::kBFloat16 && (caps & 2)) || (a.scalar_type() == at::kHalf && (caps & 1));
+  }
+  if (use_coop) {
+    // 128bit ベクトルロードが使える条件: 16 バイト整列、バッチ stride が 8 要素の倍数、連続軸でない stride も 8 の倍数、端数なし
+    auto aligned16 = [](const at::Tensor& t) { return addr_of(t) % 16 == 0; };
+    bool a_vec = aligned16(a) && a_sb % 8 == 0 && ((a_sk == 1 && a_sm % 8 == 0 && K % 8 == 0) || (a_sm == 1 && a_sk % 8 == 0 && M % 8 == 0));
+    bool b_vec = aligned16(b) && b_sb % 8 == 0 && ((b_sn == 1 && b_sk % 8 == 0 && N % 8 == 0) || (b_sk == 1 && b_sn % 8 == 0 && K % 8 == 0));
+    P.pad = (a_vec ? 1u : 0u) | (b_vec ? 2u : 0u);
+  }
+  std::string kname = std::string(use_coop ? "mm_coop_" : "mm_") + kind;
+  vk_check(vkrt_dispatch((uint32_t)kernel_index(kname), &P, sizeof(P), gx, gy, gz), "dispatch mm");
+  // デバッグ: VKT_VERIFY_MM=1 なら、協調行列の結果を同じ入力のタイル型の結果と照合し、乖離した呼び出しを報告する
+  static const bool verify = std::getenv("VKT_VERIFY_MM") != nullptr;
+  if (verify && use_coop) {
+    at::Tensor ref = batched ? at::empty({batch, M, N}, a.options()) : at::empty({M, N}, a.options());
+    MmPush Q = P;
+    Q.c = addr_of(ref);
+    Q.pad = 0;
+    vk_check(vkrt_dispatch((uint32_t)kernel_index(std::string("mm_") + kind), &Q, sizeof(Q), gx, gy, gz), "dispatch mm(verify)");
+    at::Tensor d = (out.to(at::kFloat) - ref.to(at::kFloat)).abs();
+    double dmax = d.max().item<double>();
+    double rmax = ref.to(at::kFloat).abs().max().item<double>();
+    // 要素ごとの相対差（参照が小さい要素は分母に行の最大値を使う）
+    // 要素ごとの相対差。最大値の 1e-4 倍未満の要素は分母を床で押さえる。2 ulp(bf16 で約 1.6%)を超える要素の割合を rel に使う。
+    at::Tensor rf = ref.to(at::kFloat);
+    at::Tensor denom = rf.abs().clamp_min(rmax * 1e-4);
+    double rel = (d / denom > 0.016).to(at::kFloat).mean().item<double>();
+    static int n_calls = 0, n_bad = 0;
+    n_calls++;
+    if (rel > 1e-3) {
+      n_bad++;
+      std::cerr << "[vkt VERIFY-MM BAD] rel=" << rel << " dmax=" << dmax << " rmax=" << rmax << " M=" << M << " N=" << N << " K=" << K
+                << " batch=" << batch << " a_strides=(" << a_sb << "," << a_sm << "," << a_sk << ") b_strides=(" << b_sb << "," << b_sk << ","
+                << b_sn << ") vec_flags=" << P.pad << " dtype=" << kind << " (" << n_bad << "/" << n_calls << ")" << std::endl;
+    }
+  }
   count_kernel(aten_name);
   return out;
 }
@@ -132,6 +188,11 @@ at::Tensor k_baddbmm(const at::Tensor& self, const at::Tensor& a, const at::Tens
 }
 
 }  // namespace
+
+namespace vkt {
+void set_coop_enabled(bool on) { coop_enabled().store(on); }
+uint32_t coop_caps() { return coop_caps_cached(); }
+}  // namespace vkt
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("mm", &k_mm);

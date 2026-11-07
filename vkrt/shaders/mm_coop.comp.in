@@ -1,0 +1,209 @@
+// 協調行列(VK_KHR_cooperative_matrix)版のバッチ付き行列積。bf16 / f16 入力、fp32 累積。
+// C[b] = alpha * A[b] @ B[b] + beta * bias。インタフェースは mm.comp.in と同一（push constant 112 バイト）。
+// 前提: サブグループサイズ 32 に固定して起動する（vkrt が requiredSubgroupSize=32 を指定し、workgroup=128 → 4 サブグループ）。
+//       サブグループサイズを決め打ちして誤結果になった IREE の教訓から、固定できないデバイスでは vkrt がこのカーネルを無効にする。
+// 転置オペランド: メモリ上で連続な軸に合わせて共有メモリの配置(行優先/列優先)を切り替え、coopMatLoad のレイアウトで吸収する。
+//   → グローバルメモリは常に連続方向に読める（転置コピー不要）。
+// vec_flags(pad): bit0=A を 128bit ベクトルで読める, bit1=B を読める（C++ が stride / 整列 / 端数を見て判定）。
+// KIND: 1=bf16, 2=f16
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#if KIND == 1
+#extension GL_EXT_bfloat16 : require
+#endif
+
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RU16 { uint16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer RV { uvec4 v[]; };
+
+layout(push_constant, scalar) uniform P {
+    uint64_t a;
+    uint64_t b;
+    uint64_t c;
+    uint64_t bias;
+    uint M, N, K, batch;
+    uint a_sb, a_sm, a_sk;
+    uint b_sb, b_sk, b_sn;
+    uint c_sb, c_sm, c_sn;
+    uint bias_sb, bias_sm, bias_sn;
+    float alpha, beta;
+    uint has_bias;
+    uint vec_flags;
+} p;
+
+#define BM 64
+#define BN 64
+#define BK 32
+#define S40 40   // 行優先 [64][32] / 列優先 [64][32] の stride（BK + 8: バンク衝突回避、16 バイト境界）
+#define S72 72   // 行優先 [32][64] / 列優先 [32][64] の stride（BN + 8）
+
+layout(local_size_x = 128) in;
+
+#if KIND == 1
+#define ETYPE bfloat16_t
+ETYPE from_bits(uint16_t b) { return uintBitsToBFloat16EXT(b); }
+#else
+#define ETYPE float16_t
+ETYPE from_bits(uint16_t b) { return uint16BitsToFloat16(b); }
+#endif
+
+shared ETYPE As[64 * S40 > 32 * S72 ? 64 * S40 : 32 * S72];
+shared ETYPE Bs[64 * S40 > 32 * S72 ? 64 * S40 : 32 * S72];
+shared float Cs[BM * BN];
+
+float bits_to_float(uint16_t b) {
+#if KIND == 1
+    return uintBitsToFloat(uint(b) << 16);
+#else
+    return float(uint16BitsToFloat16(b));
+#endif
+}
+
+uint16_t f2bf(float x) {
+    if (isnan(x)) return uint16_t(0x7FC0u);
+    uint u = floatBitsToUint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return uint16_t(u >> 16);
+}
+
+void store_elem(uint64_t base, uint i, float x) {
+#if KIND == 1
+    RU16(base).v[i] = f2bf(x);
+#else
+    RU16(base).v[i] = float16BitsToUint16(float16_t(x));
+#endif
+}
+
+// 128bit(8 要素)を共有メモリの連続 8 要素へ書く
+void put8(bool is_a, uint dst, uvec4 u) {
+    uint w[4] = uint[4](u.x, u.y, u.z, u.w);
+    for (uint q = 0; q < 4; ++q) {
+        ETYPE lo = from_bits(uint16_t(w[q] & 0xFFFFu));
+        ETYPE hi = from_bits(uint16_t(w[q] >> 16));
+        if (is_a) { As[dst + 2 * q] = lo; As[dst + 2 * q + 1] = hi; }
+        else      { Bs[dst + 2 * q] = lo; Bs[dst + 2 * q + 1] = hi; }
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;               // 0..3（サブグループサイズ 32 固定）
+    const uint row0 = gl_WorkGroupID.y * BM;
+    const uint col0 = gl_WorkGroupID.x * BN;
+    const uint bz = gl_WorkGroupID.z;
+    const uint a_base = bz * p.a_sb;
+    const uint b_base = bz * p.b_sb;
+    const bool a_kc = (p.a_sk == 1u);            // A は k 方向に連続 -> 行優先 [m][k]、そうでなければ列優先 [k][m]
+    const bool b_nc = (p.b_sn == 1u);            // B は n 方向に連続 -> 行優先 [k][n]、そうでなければ [n][k]
+    const bool a_vec = (p.vec_flags & 1u) != 0u;
+    const bool b_vec = (p.vec_flags & 2u) != 0u;
+
+    const uint tm0 = (sg >> 1) * 32u;
+    const uint tn0 = (sg & 1u) * 32u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2][2];
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 2; ++j) acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        // ---- A タイル (64 m x 32 k) ----
+        if (a_vec) {
+            for (uint e = 0; e < 2; ++e) {
+                uint v = tid + e * 128u;
+                uvec4 u = uvec4(0u);
+                uint dst;
+                if (a_kc) {  // [m][k]: v -> (m = v/4, 4 個の 8 要素)
+                    uint m = v >> 2, kq = v & 3u;
+                    uint gm = row0 + m, gk = k0 + kq * 8u;
+                    if (gm < p.M && gk < p.K) u = RV(p.a + uint64_t(a_base + gm * p.a_sm + gk * p.a_sk) * 2ul).v[0];
+                    dst = m * S40 + kq * 8u;
+                } else {     // [k][m]: v -> (k = v/8, 8 個の 8 要素)
+                    uint kk = v >> 3, mq = v & 7u;
+                    uint gm = row0 + mq * 8u, gk = k0 + kk;
+                    if (gm < p.M && gk < p.K) u = RV(p.a + uint64_t(a_base + gm * p.a_sm + gk * p.a_sk) * 2ul).v[0];
+                    dst = kk * S72 + mq * 8u;
+                }
+                put8(true, dst, u);
+            }
+        } else {
+            for (uint e = 0; e < 16; ++e) {
+                uint idx = tid + e * 128u;
+                uint m, k;
+                if (a_kc) { k = idx % BK; m = idx / BK; } else { m = idx % BM; k = idx / BM; }
+                uint gm = row0 + m, gk = k0 + k;
+                ETYPE v = from_bits(uint16_t(0));
+                if (gm < p.M && gk < p.K) v = from_bits(RU16(p.a).v[a_base + gm * p.a_sm + gk * p.a_sk]);
+                if (a_kc) As[m * S40 + k] = v; else As[k * S72 + m] = v;
+            }
+        }
+        // ---- B タイル (32 k x 64 n) ----
+        if (b_vec) {
+            for (uint e = 0; e < 2; ++e) {
+                uint v = tid + e * 128u;
+                uvec4 u = uvec4(0u);
+                uint dst;
+                if (b_nc) {  // [k][n]
+                    uint kk = v >> 3, nq = v & 7u;
+                    uint gn = col0 + nq * 8u, gk = k0 + kk;
+                    if (gn < p.N && gk < p.K) u = RV(p.b + uint64_t(b_base + gk * p.b_sk + gn * p.b_sn) * 2ul).v[0];
+                    dst = kk * S72 + nq * 8u;
+                } else {     // [n][k]
+                    uint n = v >> 2, kq = v & 3u;
+                    uint gn = col0 + n, gk = k0 + kq * 8u;
+                    if (gn < p.N && gk < p.K) u = RV(p.b + uint64_t(b_base + gk * p.b_sk + gn * p.b_sn) * 2ul).v[0];
+                    dst = n * S40 + kq * 8u;
+                }
+                put8(false, dst, u);
+            }
+        } else {
+            for (uint e = 0; e < 16; ++e) {
+                uint idx = tid + e * 128u;
+                uint n, k;
+                if (b_nc) { n = idx % BN; k = idx / BN; } else { k = idx % BK; n = idx / BK; }
+                uint gn = col0 + n, gk = k0 + k;
+                ETYPE v = from_bits(uint16_t(0));
+                if (gn < p.N && gk < p.K) v = from_bits(RU16(p.b).v[b_base + gk * p.b_sk + gn * p.b_sn]);
+                if (b_nc) Bs[k * S72 + n] = v; else Bs[n * S40 + k] = v;
+            }
+        }
+        barrier();
+        for (uint kk = 0; kk < BK; kk += 16) {
+            coopmat<ETYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[2];
+            coopmat<ETYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[2];
+            for (uint i = 0; i < 2; ++i) {
+                if (a_kc) coopMatLoad(ma[i], As, (tm0 + i * 16u) * S40 + kk, S40, gl_CooperativeMatrixLayoutRowMajor);
+                else      coopMatLoad(ma[i], As, kk * S72 + tm0 + i * 16u, S72, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            for (uint j = 0; j < 2; ++j) {
+                if (b_nc) coopMatLoad(mb[j], Bs, kk * S72 + tn0 + j * 16u, S72, gl_CooperativeMatrixLayoutRowMajor);
+                else      coopMatLoad(mb[j], Bs, (tn0 + j * 16u) * S40 + kk, S40, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            for (uint i = 0; i < 2; ++i)
+                for (uint j = 0; j < 2; ++j) acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 2; ++j) coopMatStore(acc[i][j], Cs, (tm0 + i * 16u) * BN + tn0 + j * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    const uint c_base = bz * p.c_sb;
+    const uint bias_base = bz * p.bias_sb;
+    for (uint e = 0; e < 32; ++e) {
+        uint idx = tid + e * 128u;
+        uint m = idx / BN, n = idx % BN;
+        uint gm = row0 + m, gn = col0 + n;
+        if (gm >= p.M || gn >= p.N) continue;
+        float r = p.alpha * Cs[idx];
+        if (p.has_bias != 0u) r += p.beta * bits_to_float(RU16(p.bias).v[bias_base + gm * p.bias_sm + gn * p.bias_sn]);
+        store_elem(p.c, c_base + gm * p.c_sm + gn * p.c_sn, r);
+    }
+}

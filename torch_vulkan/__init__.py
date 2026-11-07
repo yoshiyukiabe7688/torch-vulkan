@@ -137,13 +137,29 @@ def _print_stats_at_exit():
     print("\n[torch_vulkan stats] " + ", ".join(f"{k}={v:.3f}" for k, v in st.items()))
     top = sorted(fallback_time_by_op().items(), key=lambda kv: -kv[1])[:8]
     print("[torch_vulkan stats] fallback 時間 上位: " + ", ".join(f"{k}={v:.2f}s" for k, v in top))
+    if os.environ.get("VKRT_PROFILE"):
+        rows = [r.split("\t") for r in _C.profile().splitlines()]
+        total = sum(float(r[1]) for r in rows) or 1.0
+        print(f"[torch_vulkan profile] GPU 時間合計 {total:.1f} ms")
+        for name, ms, n in rows[:18]:
+            print(f"[torch_vulkan profile] {name:34s} {float(ms):9.1f} ms {float(ms) / total * 100:5.1f}%  x{n}  ({float(ms) / int(n) * 1000:.0f} us/回)")
     print("[torch_vulkan stats] kernel 回数 上位: " + str(sorted(kernel_counts().items(), key=lambda kv: -kv[1])[:8]))
 
 
-if os.environ.get("VKT_STATS"):
+if os.environ.get("VKT_STATS") or os.environ.get("VKRT_PROFILE"):
     import atexit
 
     atexit.register(_print_stats_at_exit)
+
+
+def coop_caps() -> int:
+    """協調行列カーネルの対応状況（bit0=f16, bit1=bf16）。0 ならタイル型 GEMM のみ。"""
+    return _C.coop_caps()
+
+
+def set_coop_enabled(on: bool) -> None:
+    """協調行列カーネルの使用を切り替える（テストでタイル型との比較に使う）。環境変数 VKT_NO_COOP=1 でも無効にできる。"""
+    _C.set_coop_enabled(bool(on))
 
 
 def fallback_counts() -> dict:

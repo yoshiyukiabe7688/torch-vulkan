@@ -347,6 +347,19 @@ const at::Tensor& wrapper_resize_(
   return self;
 }
 
+// 畳み込みは未知のバックエンドでは「上書き用」演算(convolution_overrideable)に行き着き、CPU にもその実装が無いので、
+// 通常のフォールバックでは動かない。GPU カーネルは未実装（LoRA 学習の演算には含まれない。サンプル画像生成の VAE デコードだけが使う）
+// なので、入力を CPU へ移して通常の at::convolution で計算し、結果を戻す。forward のみ（VAE は学習しない）。
+at::Tensor k_convolution_overrideable(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+                                      c10::SymIntArrayRef stride, c10::SymIntArrayRef padding, c10::SymIntArrayRef dilation, bool transposed,
+                                      c10::SymIntArrayRef output_padding, c10::SymInt groups) {
+  count_fallback("aten::convolution_overrideable");
+  std::optional<at::Tensor> b = std::nullopt;
+  if (bias.has_value() && bias->defined()) b = bias->to(at::kCPU);
+  at::Tensor out = at::convolution_symint(input.to(at::kCPU), weight.to(at::kCPU), b, stride, padding, dilation, transposed, output_padding, groups);
+  return out.to(input.device());
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
@@ -363,6 +376,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_reshape_alias", &wrapper_reshape_alias);
   m.impl("unfold", &wrapper_unfold);
   m.impl("resize_", &wrapper_resize_);
+  m.impl("convolution_overrideable", &k_convolution_overrideable);
 }
 
 // ---- autocast（torch.autocast(device_type="vk")） -------------------------------------------------------
@@ -418,6 +432,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     r["pipeline_create_s"] = vkrt_stat(4) * 1e-9;
     r["upload_MB"] = vkrt_stat(5) / 1048576.0;
     r["download_MB"] = vkrt_stat(6) / 1048576.0;
+    r["gpu_wait_s"] = vkrt_stat(7) * 1e-9;  // バッチの完了待ち(= GPU が実際に忙しかった時間の目安)
     r["fallback_s"] = g_fallback_ns.load() * 1e-9;
     return r;
   });
@@ -427,6 +442,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     for (auto& kv : g_fallback_ns_by_op) r[kv.first] = kv.second * 1e-9;
     return r;
   });
+  m.def("profile", [] {
+    ensure_init();
+    std::string buf(1 << 16, '\0');
+    size_t n = vkrt_profile_dump(buf.data(), buf.size());
+    buf.resize(std::min(n, buf.size() - 1));
+    return buf;
+  });
+  m.def("coop_caps", [] { return vkt::coop_caps(); });
+  m.def("set_coop_enabled", [](bool on) { vkt::set_coop_enabled(on); });
   m.def("reset_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);
     g_fallback_counts.clear();

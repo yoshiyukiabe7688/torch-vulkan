@@ -138,6 +138,8 @@ pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[
     ("mm_f32", include_bytes!("../shaders/gen/mm_f32.spv"), 112),
     ("mm_bf16", include_bytes!("../shaders/gen/mm_bf16.spv"), 112),
     ("mm_f16", include_bytes!("../shaders/gen/mm_f16.spv"), 112),
+    ("mm_coop_bf16", include_bytes!("../shaders/gen/mm_coop_bf16.spv"), 112),
+    ("mm_coop_f16", include_bytes!("../shaders/gen/mm_coop_f16.spv"), 112),
     ("softmax_fwd_f32", include_bytes!("../shaders/gen/softmax_fwd_f32.spv"), 40),
     ("softmax_fwd_bf16", include_bytes!("../shaders/gen/softmax_fwd_bf16.spv"), 40),
     ("softmax_fwd_f16", include_bytes!("../shaders/gen/softmax_fwd_f16.spv"), 40),

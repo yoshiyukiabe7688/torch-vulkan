@@ -158,3 +158,64 @@ def test_throughput_report():
 
 def test_no_vulkan_validation_errors():
     assert torch_vulkan.validation_errors() == 0
+
+
+# ---- 協調行列版(mm_coop_*)の検証 ---------------------------------------------------------------------------------------------
+needs_coop = pytest.mark.skipif(torch_vulkan.coop_caps() == 0, reason="協調行列に非対応のデバイス")
+
+
+@needs_coop
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,k,n", [(32, 32, 32), (64, 64, 64), (65, 33, 97), (128, 129, 300), (100, 1000, 70), (1024, 2048, 2048), (33, 5, 64)])
+def test_coop_matches_reference_and_is_selected(dt, m, k, n):
+    a, b = rnd((m, k), dt, 1), rnd((k, n), dt, 2)
+    torch_vulkan.reset_fallback_counts()
+    out = torch.mm(a.to(dev), b.to(dev))
+    check(out, a.double() @ b.double(), dt, k)
+    no_fallback("aten::mm")
+
+
+@needs_coop
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("ta,tb", [(False, False), (True, False), (False, True), (True, True)])
+def test_coop_transposed_operands_and_bias(dt, ta, tb):
+    m, k, n = 96, 80, 70
+    a = rnd((k, m) if ta else (m, k), dt, 3)
+    b = rnd((n, k) if tb else (k, n), dt, 4)
+    A = a.to(dev).t() if ta else a.to(dev)
+    B = b.to(dev).t() if tb else b.to(dev)
+    ref = (a.t() if ta else a).double() @ (b.t() if tb else b).double()
+    check(torch.mm(A, B), ref, dt, k)
+    bias = rnd((n,), dt, 5)
+    out = torch.addmm(bias.to(dev), A, B, alpha=0.5, beta=2.0)
+    check(out, 2.0 * bias.double() + 0.5 * ref, dt, k)
+
+
+@needs_coop
+def test_coop_bmm_and_agreement_with_tiled_kernel():
+    a, b = rnd((4, 70, 90), torch.bfloat16, 1), rnd((4, 90, 50), torch.bfloat16, 2)
+    ref = torch.bmm(a.double(), b.double())
+    check(torch.bmm(a.to(dev), b.to(dev)), ref, torch.bfloat16, 90)
+    out_coop = torch.bmm(a.to(dev), b.to(dev)).cpu().float()
+    torch_vulkan.set_coop_enabled(False)
+    try:
+        out_tiled = torch.bmm(a.to(dev), b.to(dev)).cpu().float()
+    finally:
+        torch_vulkan.set_coop_enabled(True)
+    # 同じ bf16 入力・fp32 累積なので、累積順の違いによる 1 ulp 程度の差に収まる
+    assert torch.allclose(out_coop, out_tiled, rtol=1.5e-2, atol=3e-2), (out_coop - out_tiled).abs().max()
+
+
+@needs_coop
+def test_coop_throughput_report():
+    for dt in (torch.bfloat16, torch.float16):
+        n = 2048
+        a, b = torch.randn(n, n).to(dt).to(dev), torch.randn(n, n).to(dt).to(dev)
+        torch.mm(a, b)
+        torch_vulkan.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            c = torch.mm(a, b)
+        torch_vulkan.synchronize()
+        dt_s = (time.perf_counter() - t0) / 10
+        print(f"\n[perf] coop mm {dt} {n}^3: {dt_s * 1e3:.3f} ms = {2 * n ** 3 / dt_s / 1e12:.2f} TFLOPS")

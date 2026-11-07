@@ -121,9 +121,9 @@ def compile_one(name, expr, a, b, c, o):
     subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.3", dst], check=True)
 
 
-def compile_mm(dt):
-    name = f"mm_{dt}"
-    src = os.path.join(SHADERS, "mm.comp.in")
+def compile_mm(dt, coop=False):
+    name = f"mm_coop_{dt}" if coop else f"mm_{dt}"
+    src = os.path.join(SHADERS, "mm_coop.comp.in" if coop else "mm.comp.in")
     dst = os.path.join(GEN, f"{name}.spv")
     subprocess.run([GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.3", "-O", f"-I{SHADERS}", f"-DKIND={KIND[dt]}", src, "-o", dst], check=True)
     subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.3", dst], check=True)
@@ -148,6 +148,8 @@ def main():
         entries.append((v[0], PUSH_SIZE))
     for dt in FLOATS:
         entries.append((compile_mm(dt), MM_PUSH_SIZE))
+    for dt in ("bf16", "f16"):  # 協調行列版（vkrt が対応を判定し、非対応デバイスでは使われない）
+        entries.append((compile_mm(dt, coop=True), MM_PUSH_SIZE))
     for template, prefix, mode, size in ROW_KERNELS:
         for dt in FLOATS:
             entries.append((compile_row(template, prefix, mode, dt), size))

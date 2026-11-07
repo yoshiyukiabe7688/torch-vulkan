@@ -30,6 +30,10 @@ inline uint64_t addr_of(const at::Tensor& t) { return reinterpret_cast<uint64_t>
 // デバイス上の dtype 変換つきストライドコピー（ops_ew.cpp）。非対応の組み合わせなら false。
 bool ew_copy(const at::Tensor& dst, const at::Tensor& src);
 
+// 協調行列カーネルの有効/無効切替と対応状況(bit0=f16, bit1=bf16)（ops_mm.cpp）
+void set_coop_enabled(bool on);
+uint32_t coop_caps();
+
 // カーネル名 -> 番号（キャッシュ付き）。無ければ例外。
 int kernel_index(const std::string& name);
 
