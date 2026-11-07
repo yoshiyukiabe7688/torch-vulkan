@@ -412,6 +412,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("max_alloc", [] { ensure_init(); return vkrt_max_alloc(); });
   m.def("live_bytes", [] { ensure_init(); return vkrt_live_bytes(); });
+  m.def("peak_live_bytes", [] { ensure_init(); return vkrt_peak_live_bytes(); });
+  m.def("reset_peak_live_bytes", [] { ensure_init(); vkrt_reset_peak_live_bytes(); });
+  m.def("set_memory_limit", [](uint64_t bytes) { ensure_init(); vkrt_set_memory_limit(bytes); });
   m.def("synchronize", [] { ensure_init(); vk_check(vkrt_synchronize(), "synchronize"); });
   m.def("empty_cache", [] { ensure_init(); return vkrt_empty_cache(); });
   m.def("reserved_bytes", [] { ensure_init(); return vkrt_reserved_bytes(); });

@@ -59,6 +59,21 @@ def live_bytes() -> int:
     return _C.live_bytes()
 
 
+def peak_live_bytes() -> int:
+    """確保中バイト数の最大値（reset_peak_live_bytes 以降）。学習中の VRAM ピークの目安。"""
+    return _C.peak_live_bytes()
+
+
+def reset_peak_live_bytes() -> None:
+    _C.reset_peak_live_bytes()
+
+
+def set_memory_limit(megabytes: int) -> None:
+    """予約メモリの上限（MiB, 0 で無制限）。小さい VRAM の GPU を模擬する。超えると OOM（RuntimeError）になる。
+    環境変数 VKT_MEM_LIMIT_MB でも指定できる（import 時に反映）。最初の確保より前に呼ぶこと。"""
+    _C.set_memory_limit(int(megabytes) << 20)
+
+
 def kernel_counts() -> dict:
     return dict(_C.kernel_counts())
 
@@ -216,3 +231,7 @@ def reset_coop_calls() -> None:
 def coop_calls() -> int:
     """デバッグ用: 協調行列の対象になった mm 呼び出しの通し番号（リセット後の累計）。"""
     return _C.coop_calls()
+
+
+if os.environ.get("VKT_MEM_LIMIT_MB"):
+    set_memory_limit(int(os.environ["VKT_MEM_LIMIT_MB"]))

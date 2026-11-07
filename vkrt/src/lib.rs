@@ -110,6 +110,12 @@ struct Runtime {
     max_alloc: u64,
     device_name: String,
     live_bytes: u64,
+    /// live_bytes の最大値（vkrt_reset_peak_live_bytes でリセット）
+    peak_live: u64,
+    /// 予約(スラブ)の上限。0 なら無制限。小さい VRAM の GPU を模擬するために使う
+    mem_limit: u64,
+    slab_bytes: u64,
+    dedicated_min: u64,
 }
 
 // vk のハンドルは u64 / ポインタ。Mutex 経由でしか触らないので Send にしてよい。
@@ -451,6 +457,10 @@ impl Runtime {
                 max_alloc,
                 device_name,
                 live_bytes: 0,
+                peak_live: 0,
+                mem_limit: 0,
+                slab_bytes: SLAB_BYTES,
+                dedicated_min: DEDICATED_MIN,
             })
         }
     }
@@ -618,7 +628,7 @@ impl Runtime {
         if rounded > self.max_alloc {
             return Err(format!("割り当てサイズ {size} が maxMemoryAllocationSize {} を超えています", self.max_alloc));
         }
-        let addr = if rounded >= DEDICATED_MIN {
+        let addr = if rounded >= self.dedicated_min {
             let base = self.new_slab_with_retry(rounded, true)?;
             let slab = self.slabs.get_mut(&base).unwrap();
             slab.free.clear();
@@ -627,26 +637,44 @@ impl Runtime {
         } else if let Some(a) = self.carve(rounded) {
             a
         } else {
-            self.new_slab_with_retry(SLAB_BYTES, false)?;
+            let slab_bytes = self.slab_bytes;
+            self.new_slab_with_retry(slab_bytes, false)?;
             self.carve(rounded).ok_or("スラブ作成直後の割り当てに失敗")?
         };
         self.blocks.insert(addr, Block { size: rounded, req: size });
         self.live_bytes += rounded;
+        self.peak_live = self.peak_live.max(self.live_bytes);
         Ok(addr)
     }
 
     /// OOM のときは空きスラブを返却して 1 回だけ再試行する。
     fn new_slab_with_retry(&mut self, size: u64, dedicated: bool) -> R<u64> {
-        match self.new_slab(size, dedicated) {
+        match self.new_slab_checked(size, dedicated) {
             Ok(b) => Ok(b),
             Err(first) => {
                 if self.empty_cache() == 0 {
                     return Err(first);
                 }
                 let live = self.live_bytes;
-                self.new_slab(size, dedicated).map_err(|e| format!("{e}（空きスラブ返却後も失敗。確保中 {live} bytes）"))
+                self.new_slab_checked(size, dedicated).map_err(|e| format!("{e}（空きスラブ返却後も失敗。確保中 {live} bytes）"))
             }
         }
+    }
+
+    /// VRAM 上限（模擬）を確認してからスラブを作る。
+    fn new_slab_checked(&mut self, size: u64, dedicated: bool) -> R<u64> {
+        if self.mem_limit > 0 {
+            let reserved = self.reserved_bytes();
+            if reserved + size > self.mem_limit {
+                return Err(format!(
+                    "VRAM 上限 {} MiB を超えます（予約 {} MiB + 要求 {} MiB）",
+                    self.mem_limit >> 20,
+                    reserved >> 20,
+                    size >> 20
+                ));
+            }
+        }
+        self.new_slab(size, dedicated)
     }
 
     fn free(&mut self, addr: u64) -> R<()> {
@@ -911,6 +939,38 @@ pub extern "C" fn vkrt_max_alloc() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_live_bytes() -> u64 {
     report(with_rt(|rt| Ok(rt.live_bytes)))
+}
+
+/// live_bytes の最大値（直近のリセット以降）。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_peak_live_bytes() -> u64 {
+    report(with_rt(|rt| Ok(rt.peak_live)))
+}
+
+/// 最大値を現在値に戻す。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_reset_peak_live_bytes() {
+    let _ = with_rt(|rt| {
+        rt.peak_live = rt.live_bytes;
+        Ok(())
+    });
+}
+
+/// 予約メモリの上限を設定する（0 で無制限）。小さい VRAM の GPU を模擬して、収まるかを検証するために使う。
+/// 上限があるときはスラブを 256 MiB（専用バッファの閾値は 128 MiB）にして、細かく確保する。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_set_memory_limit(bytes: u64) {
+    let _ = with_rt(|rt| {
+        rt.mem_limit = bytes;
+        if bytes > 0 {
+            rt.slab_bytes = (256u64 << 20).min(bytes / 4).max(32 << 20);
+            rt.dedicated_min = rt.slab_bytes / 2;
+        } else {
+            rt.slab_bytes = SLAB_BYTES;
+            rt.dedicated_min = DEDICATED_MIN;
+        }
+        Ok(())
+    });
 }
 
 /// デバイスメモリを確保し、デバイスアドレス（= PyTorch の data_ptr）を返す。失敗時 0。

@@ -1,5 +1,5 @@
 """実 Anima の 1 step (fwd+bwd) を指定モードで実行し、LoRA 勾配・ブロック出力・ブロック出力勾配を保存する。
-使い方: python gradcmp.py <mode> <out.pt> [--up rand] [--nblocks N]
+使い方: python gradcmp.py <mode> <out.pt> [--up rand]
   mode: cpu32（基準, fp32）/ cpu16（CPU bf16）/ vk（協調行列あり）/ vk_tiled（VKT_NO_COOP=1 相当）
 環境変数: SD_SCRIPTS_DIR（sd-scripts のパス）、ANIMA_DIT（重み）、ANIMA_CACHE_DIR（潜在とテキスト出力のキャッシュ）、PYTHONPATH に torch-vulkan。
   --sdpa32: vk のみ、アテンションのロジットと softmax を fp32 で計算（精度確認用。標準より約 70% 遅い）
