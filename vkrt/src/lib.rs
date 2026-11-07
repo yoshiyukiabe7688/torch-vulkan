@@ -109,7 +109,16 @@ struct Runtime {
     mem_device_local: u32,
     max_alloc: u64,
     device_name: String,
+    pd: vk::PhysicalDevice,
+    /// VK_EXT_memory_budget が使えるか（OS が把握する「他のプロセスや表示用を除いた」使用可能量が取れる）
+    has_budget: bool,
     live_bytes: u64,
+    /// live_bytes の最大値（vkrt_reset_peak_live_bytes でリセット）
+    peak_live: u64,
+    /// 予約(スラブ)の上限。0 なら無制限。小さい VRAM の GPU を模擬するために使う
+    mem_limit: u64,
+    slab_bytes: u64,
+    dedicated_min: u64,
 }
 
 // vk のハンドルは u64 / ポインタ。Mutex 経由でしか触らないので Send にしてよい。
@@ -254,6 +263,7 @@ impl Runtime {
             let has_ext = |n: &CStr| dev_exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|x| x == n));
             let ext_coop = c"VK_KHR_cooperative_matrix";
             let ext_bf16 = c"VK_KHR_shader_bfloat16";
+            let ext_budget = c"VK_EXT_memory_budget";
             let mut q_coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut q_bf = Bf16Features::default();
             let mut q13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -306,6 +316,10 @@ impl Runtime {
             let bf16_ok = coop_ok && has_ext(ext_bf16) && q_bf.shader_bfloat16_type != 0 && q_bf.shader_bfloat16_cooperative_matrix != 0;
                         let coop_caps: u32 = if coop_ok { 1 | if bf16_ok { 2 } else { 0 } } else { 0 };
             let mut dev_ext_ptrs: Vec<*const c_char> = vec![];
+            let has_budget = has_ext(ext_budget);
+            if has_budget {
+                dev_ext_ptrs.push(ext_budget.as_ptr());
+            }
             if coop_ok {
                 dev_ext_ptrs.push(ext_coop.as_ptr());
             }
@@ -450,7 +464,14 @@ impl Runtime {
                 mem_device_local,
                 max_alloc,
                 device_name,
+                pd,
+                has_budget,
                 live_bytes: 0,
+                peak_live: 0,
+                mem_limit: 0,
+                // 1 回の割り当て上限が小さいデバイスでは、スラブ（1 つの割り当て）もそれに収める
+                slab_bytes: SLAB_BYTES.min(max_alloc),
+                dedicated_min: DEDICATED_MIN.min(max_alloc / 2),
             })
         }
     }
@@ -618,7 +639,7 @@ impl Runtime {
         if rounded > self.max_alloc {
             return Err(format!("割り当てサイズ {size} が maxMemoryAllocationSize {} を超えています", self.max_alloc));
         }
-        let addr = if rounded >= DEDICATED_MIN {
+        let addr = if rounded >= self.dedicated_min {
             let base = self.new_slab_with_retry(rounded, true)?;
             let slab = self.slabs.get_mut(&base).unwrap();
             slab.free.clear();
@@ -627,26 +648,44 @@ impl Runtime {
         } else if let Some(a) = self.carve(rounded) {
             a
         } else {
-            self.new_slab_with_retry(SLAB_BYTES, false)?;
+            let slab_bytes = self.slab_bytes;
+            self.new_slab_with_retry(slab_bytes, false)?;
             self.carve(rounded).ok_or("スラブ作成直後の割り当てに失敗")?
         };
         self.blocks.insert(addr, Block { size: rounded, req: size });
         self.live_bytes += rounded;
+        self.peak_live = self.peak_live.max(self.live_bytes);
         Ok(addr)
     }
 
     /// OOM のときは空きスラブを返却して 1 回だけ再試行する。
     fn new_slab_with_retry(&mut self, size: u64, dedicated: bool) -> R<u64> {
-        match self.new_slab(size, dedicated) {
+        match self.new_slab_checked(size, dedicated) {
             Ok(b) => Ok(b),
             Err(first) => {
                 if self.empty_cache() == 0 {
                     return Err(first);
                 }
                 let live = self.live_bytes;
-                self.new_slab(size, dedicated).map_err(|e| format!("{e}（空きスラブ返却後も失敗。確保中 {live} bytes）"))
+                self.new_slab_checked(size, dedicated).map_err(|e| format!("{e}（空きスラブ返却後も失敗。確保中 {live} bytes）"))
             }
         }
+    }
+
+    /// VRAM 上限（模擬）を確認してからスラブを作る。
+    fn new_slab_checked(&mut self, size: u64, dedicated: bool) -> R<u64> {
+        if self.mem_limit > 0 {
+            let reserved = self.reserved_bytes();
+            if reserved + size > self.mem_limit {
+                return Err(format!(
+                    "VRAM 上限 {} MiB を超えます（予約 {} MiB + 要求 {} MiB）",
+                    self.mem_limit >> 20,
+                    reserved >> 20,
+                    size >> 20
+                ));
+            }
+        }
+        self.new_slab(size, dedicated)
     }
 
     fn free(&mut self, addr: u64) -> R<()> {
@@ -696,6 +735,21 @@ impl Runtime {
             }
         }
         empty.len()
+    }
+
+    /// デバイスローカルヒープの (予算, 使用量, ヒープ全体) をバイトで返す。
+    /// VK_EXT_memory_budget があれば OS が見ている値（他プロセス・表示用を含む使用量と、使ってよい予算）。無ければ予算=ヒープの 85%、使用量=自プロセスの予約量。
+    fn memory_info(&self) -> (u64, u64, u64) {
+        let heap = self.mem_props.memory_types[self.mem_device_local as usize].heap_index as usize;
+        let heap_size = self.mem_props.memory_heaps[heap].size;
+        if self.has_budget {
+            let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
+            unsafe { self.instance.get_physical_device_memory_properties2(self.pd, &mut p2) };
+            (b.heap_budget[heap], b.heap_usage[heap], heap_size)
+        } else {
+            (heap_size / 100 * 85, self.reserved_bytes(), heap_size)
+        }
     }
 
     fn reserved_bytes(&self) -> u64 {
@@ -907,10 +961,61 @@ pub extern "C" fn vkrt_max_alloc() -> u64 {
     report(with_rt(|rt| Ok(rt.max_alloc)))
 }
 
+/// デバイスローカルヒープの [予算, 使用量, ヒープ全体] を out[0..3] に書く（バイト）。成功 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_memory_info(out: *mut u64) -> i32 {
+    match with_rt(|rt| Ok(rt.memory_info())) {
+        Ok((budget, usage, size)) => {
+            unsafe {
+                *out = budget;
+                *out.add(1) = usage;
+                *out.add(2) = size;
+            }
+            0
+        }
+        Err(e) => {
+            *LAST_ERROR.lock().unwrap() = e;
+            -1
+        }
+    }
+}
+
 /// 現在確保中の合計バイト数。
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_live_bytes() -> u64 {
     report(with_rt(|rt| Ok(rt.live_bytes)))
+}
+
+/// live_bytes の最大値（直近のリセット以降）。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_peak_live_bytes() -> u64 {
+    report(with_rt(|rt| Ok(rt.peak_live)))
+}
+
+/// 最大値を現在値に戻す。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_reset_peak_live_bytes() {
+    let _ = with_rt(|rt| {
+        rt.peak_live = rt.live_bytes;
+        Ok(())
+    });
+}
+
+/// 予約メモリの上限を設定する（0 で無制限）。小さい VRAM の GPU を模擬して、収まるかを検証するために使う。
+/// 上限があるときはスラブを上限の 1/8（64〜256 MiB。専用バッファの閾値はその半分）にして、細かく確保する。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_set_memory_limit(bytes: u64) {
+    let _ = with_rt(|rt| {
+        rt.mem_limit = bytes;
+        if bytes > 0 {
+            rt.slab_bytes = (256u64 << 20).min(bytes / 8).max(64 << 20).min(rt.max_alloc); // 上限が小さいほどスラブも小さくして、詰まった所での確保失敗を避ける
+            rt.dedicated_min = rt.slab_bytes / 2;
+        } else {
+            rt.slab_bytes = SLAB_BYTES.min(rt.max_alloc);
+            rt.dedicated_min = DEDICATED_MIN.min(rt.max_alloc / 2);
+        }
+        Ok(())
+    });
 }
 
 /// デバイスメモリを確保し、デバイスアドレス（= PyTorch の data_ptr）を返す。失敗時 0。

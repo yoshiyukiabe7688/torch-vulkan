@@ -412,6 +412,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("max_alloc", [] { ensure_init(); return vkrt_max_alloc(); });
   m.def("live_bytes", [] { ensure_init(); return vkrt_live_bytes(); });
+  m.def("memory_info", [] {
+    ensure_init();
+    uint64_t v[3] = {0, 0, 0};
+    vk_check(vkrt_memory_info(v), "memory_info");
+    return std::make_tuple(v[0], v[1], v[2]);
+  });
+  m.def("peak_live_bytes", [] { ensure_init(); return vkrt_peak_live_bytes(); });
+  m.def("reset_peak_live_bytes", [] { ensure_init(); vkrt_reset_peak_live_bytes(); });
+  m.def("set_memory_limit", [](uint64_t bytes) { ensure_init(); vkrt_set_memory_limit(bytes); });
   m.def("synchronize", [] { ensure_init(); vk_check(vkrt_synchronize(), "synchronize"); });
   m.def("empty_cache", [] { ensure_init(); return vkrt_empty_cache(); });
   m.def("reserved_bytes", [] { ensure_init(); return vkrt_reserved_bytes(); });
@@ -455,6 +464,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("coop_caps", [] { return vkt::coop_caps(); });
   m.def("set_coop_enabled", [](bool on) { vkt::set_coop_enabled(on); });
+  m.def("set_coop_range", [](uint64_t lo, uint64_t hi, int kind) { vkt::set_coop_range(lo, hi, kind); });
+  m.def("reset_coop_calls", [] { vkt::reset_coop_calls(); });
+  m.def("coop_calls", [] { return vkt::coop_calls(); });
   m.def("reset_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);
     g_fallback_counts.clear();

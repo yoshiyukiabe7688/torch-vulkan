@@ -59,6 +59,28 @@ def live_bytes() -> int:
     return _C.live_bytes()
 
 
+def memory_info() -> dict:
+    """デバイスローカルメモリの状況（バイト）。budget=OS が許す使用上限（表示用や他プロセスを除く）、usage=OS から見た使用量
+    （他プロセス込み）、heap=ヒープ全体。VK_EXT_memory_budget が無い GPU では budget=ヒープの 85%。"""
+    budget, usage, heap = _C.memory_info()
+    return {"budget": budget, "usage": usage, "heap": heap}
+
+
+def peak_live_bytes() -> int:
+    """確保中バイト数の最大値（reset_peak_live_bytes 以降）。学習中の VRAM ピークの目安。"""
+    return _C.peak_live_bytes()
+
+
+def reset_peak_live_bytes() -> None:
+    _C.reset_peak_live_bytes()
+
+
+def set_memory_limit(megabytes: int) -> None:
+    """予約メモリの上限（MiB, 0 で無制限）。小さい VRAM の GPU を模擬する。超えると OOM（RuntimeError）になる。
+    環境変数 VKT_MEM_LIMIT_MB でも指定できる（import 時に反映）。最初の確保より前に呼ぶこと。"""
+    _C.set_memory_limit(int(megabytes) << 20)
+
+
 def kernel_counts() -> dict:
     return dict(_C.kernel_counts())
 
@@ -200,3 +222,23 @@ def _register():
 
 
 _register()
+
+
+def set_coop_range(lo: int = 0, hi: int = 2**64 - 1, kind: int = 0) -> None:
+    """デバッグ用: 協調行列の対象になる mm の通し番号 [lo, hi) だけ協調行列を使う（それ以外はタイル型）。
+    kind: 0=すべて, 1=bmm のみ, 2=mm のみ。誤差の原因となる呼び出しの二分探索に使う。"""
+    _C.set_coop_range(int(lo), int(hi), int(kind))
+
+
+def reset_coop_calls() -> None:
+    """デバッグ用: 通し番号を 0 に戻す。"""
+    _C.reset_coop_calls()
+
+
+def coop_calls() -> int:
+    """デバッグ用: 協調行列の対象になった mm 呼び出しの通し番号（リセット後の累計）。"""
+    return _C.coop_calls()
+
+
+if os.environ.get("VKT_MEM_LIMIT_MB"):
+    set_memory_limit(int(os.environ["VKT_MEM_LIMIT_MB"]))
