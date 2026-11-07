@@ -198,3 +198,33 @@ def test_cat_legacy_empty_and_noncontiguous_and_backward():
 
 def test_no_vulkan_validation_errors():
     assert torch_vulkan.validation_errors() == 0
+
+
+# ---- softmax の dtype 変換・_safe_softmax（SDPA の算術実装が使う） -------------------------------------------------------------
+def test_softmax_half_to_float_and_safe_softmax_with_fully_masked_rows():
+    x = rnd((4, 33), torch.bfloat16, scale=3.0)
+    out = torch.softmax(x.to(dev), -1, dtype=torch.float32)  # half_to_float
+    assert out.dtype == torch.float32
+    close(out, torch.softmax(x.double(), -1), torch.float32, mult=300.0)  # 入力 bf16 丸め後の値は同じなので fp32 精度で一致する
+    y = rnd((4, 33), torch.float32)
+    y[1, :] = float("-inf")  # 全マスク行
+    y[2, :5] = float("-inf")
+    o = torch._safe_softmax(y.to(dev), -1)
+    ref = torch._safe_softmax(y, -1)
+    assert torch.allclose(o.cpu(), ref, atol=1e-6) and torch.equal(o.cpu()[1], torch.zeros(33))
+    no_fallback("aten::_safe_softmax", "aten::isneginf", "aten::all", "aten::where")
+
+
+def test_sdpa_math_path_runs_without_cpu_fallback_and_matches_cpu():
+    q, k, v = [rnd((1, 4, 70, 32), torch.bfloat16, seed=i) for i in range(3)]
+    mask = (rnd((1, 1, 1, 70), seed=9) > -0.5)
+    qd, kd, vd = [t.to(dev).requires_grad_(True) for t in (q, k, v)]
+    qc, kc, vc = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    o = F.scaled_dot_product_attention(qd, kd, vd, attn_mask=mask.to(dev))
+    oc = F.scaled_dot_product_attention(qc, kc, vc, attn_mask=mask)
+    o.float().pow(2).mean().backward()
+    oc.float().pow(2).mean().backward()
+    assert torch.allclose(o.detach().cpu().float(), oc.detach().float(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(qd.grad.cpu().float(), qc.grad.float(), atol=1e-3, rtol=5e-2)
+    fb = torch_vulkan.fallback_counts()
+    assert not {n for n in fb if n in ("aten::_softmax_backward_data", "aten::isneginf", "aten::all", "aten::where")}, fb

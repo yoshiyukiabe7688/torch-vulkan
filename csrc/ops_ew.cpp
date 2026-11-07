@@ -202,25 +202,33 @@ std::optional<at::Tensor> try_binary(Bin op, const at::Tensor& a, const at::Tens
   if (is_vk(a) && host_scalar(b)) {
     t = &a;
     s = &b;
-  } else if (!self_inplace && host_scalar(a) && is_vk(b) && (op == Bin::Mul || (op == Bin::Add && alpha == 1.0))) {
-    t = &b;  // 可換演算のみ左右を入れ替える
+  } else if (!self_inplace && host_scalar(a) && is_vk(b)) {
+    t = &b;  // スカラーが左: S op x を専用カーネル(axpb / muls / rdivs)で処理する
     s = &a;
     scalar_on_left = true;
   } else {
     return std::nullopt;
   }
-  (void)scalar_on_left;
   const char* kt = float_kind(t->scalar_type());
   if (!kt) return std::nullopt;
   if (at::result_type(*t, *s) != t->scalar_type()) return std::nullopt;  // 型が変わる（整数テンソル + 実数スカラー等）は CPU へ
   double v = s->item<double>();
   const char* sop;
-  double s0;
-  switch (op) {
-    case Bin::Add: sop = "adds"; s0 = alpha * v; break;
-    case Bin::Sub: sop = "adds"; s0 = -alpha * v; break;
-    case Bin::Mul: sop = "muls"; s0 = v; break;
-    default: sop = "divs"; s0 = v; break;
+  double s0, s1 = 0.0;
+  if (!scalar_on_left) {
+    switch (op) {
+      case Bin::Add: sop = "adds"; s0 = alpha * v; break;
+      case Bin::Sub: sop = "adds"; s0 = -alpha * v; break;
+      case Bin::Mul: sop = "muls"; s0 = v; break;
+      default: sop = "divs"; s0 = v; break;
+    }
+  } else {
+    switch (op) {
+      case Bin::Add: sop = "axpb"; s0 = alpha; s1 = v; break;   // S + alpha * x
+      case Bin::Sub: sop = "axpb"; s0 = -alpha; s1 = v; break;  // S - alpha * x
+      case Bin::Mul: sop = "muls"; s0 = v; break;
+      default: sop = "rdivs"; s0 = v; break;                    // S / x
+    }
   }
   IntVec sizes(t->sizes().begin(), t->sizes().end());
   if (self_inplace) {
@@ -230,12 +238,12 @@ std::optional<at::Tensor> try_binary(Bin op, const at::Tensor& a, const at::Tens
   if (self_inplace) {
     IntVec so(self_inplace->strides().begin(), self_inplace->strides().end());
     if (!ew_prepare(P, sizes, so, t, nullptr, nullptr)) return std::nullopt;
-    ew_run(std::string("ew_") + sop + "_" + kt + "_" + kt, aten_name, P, *self_inplace, t, nullptr, nullptr, (float)s0);
+    ew_run(std::string("ew_") + sop + "_" + kt + "_" + kt, aten_name, P, *self_inplace, t, nullptr, nullptr, (float)s0, (float)s1);
     return *self_inplace;
   }
   if (!ew_prepare(P, sizes, contiguous_strides(sizes), t, nullptr, nullptr)) return std::nullopt;
   at::Tensor out = at::empty(sizes, t->options());
-  ew_run(std::string("ew_") + sop + "_" + kt + "_" + kt, aten_name, P, out, t, nullptr, nullptr, (float)s0);
+  ew_run(std::string("ew_") + sop + "_" + kt + "_" + kt, aten_name, P, out, t, nullptr, nullptr, (float)s0, (float)s1);
   return out;
 }
 

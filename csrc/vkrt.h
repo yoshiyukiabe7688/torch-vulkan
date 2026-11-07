@@ -22,4 +22,5 @@ uint64_t vkrt_reserved_bytes();
 size_t vkrt_live_blocks();
 size_t vkrt_slab_count();
 size_t vkrt_validation_errors();
+uint64_t vkrt_stat(uint32_t i);
 }

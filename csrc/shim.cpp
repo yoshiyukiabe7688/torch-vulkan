@@ -17,6 +17,8 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -50,6 +52,8 @@ void ensure_init() {
 std::mutex g_stats_mutex;
 std::map<std::string, int64_t> g_fallback_counts;
 std::map<std::string, int64_t> g_kernel_counts;
+std::atomic<uint64_t> g_fallback_ns{0};
+std::map<std::string, uint64_t> g_fallback_ns_by_op;
 
 void count_fallback(const std::string& name) {
   std::lock_guard<std::mutex> lock(g_stats_mutex);
@@ -63,13 +67,66 @@ void count_kernel(const std::string& name) {
 
 // ---- CPU フォールバック ------------------------------------------------------------------------
 void vulkan_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  auto t_start = std::chrono::steady_clock::now();
+  struct Done {
+    std::chrono::steady_clock::time_point t;
+    const c10::OperatorHandle& op;
+    ~Done() {
+      uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count();
+      g_fallback_ns += ns;
+      std::lock_guard<std::mutex> lock(g_stats_mutex);
+      g_fallback_ns_by_op[op.schema().operator_name().name] += ns;
+    }
+  } done{t_start, op};
   // デバッグ用: VKT_TRACE_FALLBACK=1 でフォールバックした演算のスキーマ(オーバーロード込み)を stderr に出す
   static const bool trace = std::getenv("VKT_TRACE_FALLBACK") != nullptr;
   if (trace) {
     std::cerr << "[vkt fallback] " << op.schema() << std::endl;
+    // vk と CPU(0 次元でない)のテンソルが混在していれば警告する。CUDA ならエラーになる状況で、CPU 結果が返って後段が壊れる原因になる。
+    auto args = torch::jit::last(*stack, op.schema().arguments().size());
+    bool has_vk = false, has_cpu = false;
+    std::string desc;
+    for (const auto& a : args) {
+      if (a.isTensor() && a.toTensor().defined()) {
+        const auto& t = a.toTensor();
+        if (is_vk(t)) has_vk = true;
+        else if (t.dim() > 0) has_cpu = true;
+        desc += std::string(is_vk(t) ? " vk" : " cpu") + c10::str(t.sizes()) + c10::str(t.scalar_type());
+      }
+    }
+    std::cerr << "[vkt fallback-args]" << desc << std::endl;
+    if (has_vk && has_cpu) std::cerr << "[vkt MIXED-DEVICE] " << op.schema().operator_name() << ":" << desc << std::endl;
   }
   count_fallback(op.schema().operator_name().name);
+
+  // cpu_fallback は「最初のテンソル引数」のデバイスへ結果を戻す。最初が CPU の 0 次元スカラー(例: 1 - x の 1)で
+  // 他に vk のテンソルがあると、結果が CPU に置かれて後段が静かに CPU に混ざる。その場合は結果を vk へ移す。
+  bool first_is_cpu = false, seen_first = false, has_vk = false;
+  {
+    auto args = torch::jit::last(*stack, op.schema().arguments().size());
+    for (const auto& a : args) {
+      if (a.isTensor() && a.toTensor().defined()) {
+        if (!seen_first) {
+          seen_first = true;
+          first_is_cpu = !is_vk(a.toTensor());
+        }
+        has_vk = has_vk || is_vk(a.toTensor());
+      } else if (a.isTensorList()) {
+        for (const at::Tensor& t : a.toTensorList()) has_vk = has_vk || is_vk(t);
+      }
+    }
+  }
   at::native::cpu_fallback(op, stack);
+  if (first_is_cpu && has_vk) {
+    size_t n_ret = op.schema().returns().size();
+    auto rets = torch::jit::last(*stack, n_ret);
+    for (size_t i = 0; i < n_ret; ++i) {
+      auto& v = (*stack)[stack->size() - n_ret + i];
+      if (v.isTensor() && v.toTensor().defined() && !is_vk(v.toTensor())) {
+        v = v.toTensor().to(c10::Device(kDev, 0));
+      }
+    }
+  }
 }
 
 int kernel_index(const std::string& name) {
@@ -350,6 +407,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kernel_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);
     return g_kernel_counts;
+  });
+  m.def("stats", [] {
+    ensure_init();
+    std::map<std::string, double> r;
+    r["dispatch_s"] = vkrt_stat(0) * 1e-9;
+    r["dispatch_n"] = (double)vkrt_stat(1);
+    r["transfer_s"] = vkrt_stat(2) * 1e-9;
+    r["transfer_n"] = (double)vkrt_stat(3);
+    r["pipeline_create_s"] = vkrt_stat(4) * 1e-9;
+    r["upload_MB"] = vkrt_stat(5) / 1048576.0;
+    r["download_MB"] = vkrt_stat(6) / 1048576.0;
+    r["fallback_s"] = g_fallback_ns.load() * 1e-9;
+    return r;
+  });
+  m.def("fallback_time_by_op", [] {
+    std::lock_guard<std::mutex> lock(g_stats_mutex);
+    std::map<std::string, double> r;
+    for (auto& kv : g_fallback_ns_by_op) r[kv.first] = kv.second * 1e-9;
+    return r;
   });
   m.def("reset_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);

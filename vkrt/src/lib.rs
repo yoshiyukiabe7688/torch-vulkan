@@ -93,6 +93,11 @@ struct Runtime {
 unsafe impl Send for Runtime {}
 
 static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
+/// 統計(ns / 回数)。0=dispatch 時間, 1=dispatch 回数, 2=転送(upload/download/d2d)時間, 3=転送回数, 4=パイプライン作成時間
+static STATS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+fn stat_add(i: usize, v: u64) {
+    STATS[i].fetch_add(v as usize, Ordering::Relaxed);
+}
 static RT: OnceLock<Mutex<Runtime>> = OnceLock::new();
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -516,12 +521,18 @@ impl Runtime {
         if push.len() as u32 != push_size || push.len() as u32 > PUSH_MAX {
             return Err(format!("push constant のサイズ不一致: {} (期待 {})", push.len(), push_size));
         }
+        let t_pipe = std::time::Instant::now();
         let pipeline = self.ensure_pipeline(idx)?;
-        self.submit_sync(|d, c| unsafe {
+        stat_add(4, t_pipe.elapsed().as_nanos() as u64);
+        let t0 = std::time::Instant::now();
+        let r = self.submit_sync(|d, c| unsafe {
             d.cmd_bind_pipeline(c, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(c, self.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             d.cmd_dispatch(c, gx, gy, gz);
-        })
+        });
+        stat_add(0, t0.elapsed().as_nanos() as u64);
+        stat_add(1, 1);
+        r
     }
 }
 
@@ -643,7 +654,12 @@ fn status(r: R<()>) -> i32 {
 /// `src` は `n` バイト読めること。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vkrt_upload(dst: u64, src: *const c_void, n: u64) -> i32 {
-    status(with_rt(|rt| rt.upload(dst, src as *const u8, n)))
+    let t0 = std::time::Instant::now();
+    let r = status(with_rt(|rt| rt.upload(dst, src as *const u8, n)));
+    stat_add(2, t0.elapsed().as_nanos() as u64);
+    stat_add(3, 1);
+    stat_add(5, n);
+    r
 }
 
 /// デバイス → ホスト。
@@ -652,7 +668,12 @@ pub unsafe extern "C" fn vkrt_upload(dst: u64, src: *const c_void, n: u64) -> i3
 /// `dst` は `n` バイト書けること。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vkrt_download(dst: *mut c_void, src: u64, n: u64) -> i32 {
-    status(with_rt(|rt| rt.download(dst as *mut u8, src, n)))
+    let t0 = std::time::Instant::now();
+    let r = status(with_rt(|rt| rt.download(dst as *mut u8, src, n)));
+    stat_add(2, t0.elapsed().as_nanos() as u64);
+    stat_add(3, 1);
+    stat_add(6, n);
+    r
 }
 
 /// デバイス → デバイス（連続領域）。
@@ -715,4 +736,10 @@ pub extern "C" fn vkrt_live_blocks() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_slab_count() -> usize {
     report(with_rt(|rt| Ok(rt.slabs.len())))
+}
+
+/// 統計値の取得（番号は STATS の定義参照）。5=アップロード総バイト, 6=ダウンロード総バイト。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_stat(i: u32) -> u64 {
+    STATS.get(i as usize).map(|a| a.load(Ordering::Relaxed) as u64).unwrap_or(0)
 }

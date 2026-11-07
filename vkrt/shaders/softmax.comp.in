@@ -12,7 +12,7 @@ layout(push_constant, scalar) uniform P {
     uint outer;
     uint R;
     uint inner;
-    uint pad;
+    uint safe;   // MODE0: 非 0 なら全要素 -inf の行を 0 にする（_safe_softmax）
 } p;  // 合計 40 バイト
 
 layout(local_size_x = 256) in;
@@ -28,12 +28,13 @@ void main() {
     float m = -3.402823466e+38;
     for (uint r = t; r < p.R; r += 256u) m = max(m, ldK(p.x, base + r * stride));
     m = block_max(m);
+    bool all_masked = (m <= -3.4e38);
     float s = 0.0;
     for (uint r = t; r < p.R; r += 256u) s += exp(ldK(p.x, base + r * stride) - m);
     s = block_sum(s);
     for (uint r = t; r < p.R; r += 256u) {
         uint idx = base + r * stride;
-        stK(p.y, idx, exp(ldK(p.x, idx) - m) / s);
+        stK(p.y, idx, (p.safe != 0u && all_masked) ? 0.0 : exp(ldK(p.x, idx) - m) / s);
     }
 #else
     float d = 0.0;

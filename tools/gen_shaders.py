@@ -50,6 +50,8 @@ SCALAR = {
     "muls": "x * S0",
     "divs": "x / S0",
     "pows": "pow_f(x, S0)",
+    "axpb": "S0 * x + S1",  # スカラー左の add / sub（alpha 付き）: S + alpha*x
+    "rdivs": "S0 / x",  # スカラー左の div
 }
 UNARY = {
     "neg": "-x",

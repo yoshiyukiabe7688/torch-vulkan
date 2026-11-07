@@ -261,3 +261,27 @@ def test_mlp_training_matches_cpu_and_uses_gpu_kernels():
 
 def test_no_vulkan_validation_errors():
     assert torch_vulkan.validation_errors() == 0
+
+
+# ---- スカラーが左にある演算（回帰: 1 - x が CPU テンソルを返して後段が CPU に混ざった） ------------------------------------------
+@pytest.mark.parametrize("dt", DTYPES)
+def test_scalar_on_the_left_stays_on_device_and_uses_gpu_kernels(dt):
+    x = rnd((5, 7), dt, lo=0.5, hi=3.0)
+    xd = x.to(dev)
+    cases = {
+        "1 - x": (lambda t: 1 - t), "2 / x": (lambda t: 2 / t), "0.5 + x": (lambda t: 0.5 + t), "3 * x": (lambda t: 3 * t),
+        "sub alpha": (lambda t: torch.sub(2.0, t, alpha=3)), "add alpha": (lambda t: torch.add(2.0, t, alpha=2)),
+    }
+    for name, fn in cases.items():
+        out = fn(xd)
+        assert out.device.type == "vk", f"{name}: 出力が {out.device} になった"
+        close(out, fn(x), dt, scale=2.0)
+    no_fallback("aten::sub", "aten::add", "aten::div", "aten::mul")
+
+
+def test_cpu_fallback_result_is_moved_back_to_device_when_first_arg_is_cpu_scalar():
+    # atan2 は GPU カーネルが無くフォールバックする。最初の引数が CPU の 0 次元でも、結果は vk に置かれること。
+    x = rnd((4, 4), lo=0.5, hi=3.0)
+    out = torch.atan2(torch.tensor(2.0), x.to(dev))
+    assert out.device.type == "vk"
+    assert torch.allclose(out.cpu(), torch.atan2(torch.tensor(2.0), x), atol=1e-6)

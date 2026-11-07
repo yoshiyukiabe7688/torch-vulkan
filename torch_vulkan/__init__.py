@@ -124,6 +124,28 @@ def set_rng_state(new_state, device="vk") -> None:
     return None
 
 
+def stats() -> dict:
+    return dict(_C.stats())
+
+
+def fallback_time_by_op() -> dict:
+    return dict(_C.fallback_time_by_op())
+
+
+def _print_stats_at_exit():
+    st = stats()
+    print("\n[torch_vulkan stats] " + ", ".join(f"{k}={v:.3f}" for k, v in st.items()))
+    top = sorted(fallback_time_by_op().items(), key=lambda kv: -kv[1])[:8]
+    print("[torch_vulkan stats] fallback 時間 上位: " + ", ".join(f"{k}={v:.2f}s" for k, v in top))
+    print("[torch_vulkan stats] kernel 回数 上位: " + str(sorted(kernel_counts().items(), key=lambda kv: -kv[1])[:8]))
+
+
+if os.environ.get("VKT_STATS"):
+    import atexit
+
+    atexit.register(_print_stats_at_exit)
+
+
 def fallback_counts() -> dict:
     return dict(_C.fallback_counts())
 

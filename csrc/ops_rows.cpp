@@ -36,7 +36,7 @@ void dispatch(const std::string& kernel, const void* push, uint32_t push_size, u
 // ---- softmax ---------------------------------------------------------------------------------------------
 struct SoftmaxPush {
   uint64_t x, y, g;
-  uint32_t outer, R, inner, pad;
+  uint32_t outer, R, inner, safe;
 };
 static_assert(sizeof(SoftmaxPush) == 40, "softmax.comp.in の push constant は 40 バイト");
 
@@ -55,29 +55,46 @@ bool softmax_dims(const at::Tensor& t, int64_t dim, uint32_t& outer, uint32_t& R
   return true;
 }
 
-at::Tensor k_softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
-  const char* k = is_vk(self) ? fkind(self.scalar_type()) : nullptr;
+// softmax の共通実装。入力を dtype へ（必要なら GPU 上で）変換してから行カーネルを実行する。
+std::optional<at::Tensor> try_softmax(const at::Tensor& self, int64_t dim, std::optional<at::ScalarType> out_dtype, bool safe,
+                                      const char* aten_name) {
+  if (!is_vk(self) || self.numel() == 0) return std::nullopt;
+  at::ScalarType dt = out_dtype.value_or(self.scalar_type());
+  const char* k = fkind(dt);
+  if (!k || !fkind(self.scalar_type())) return std::nullopt;
   uint32_t outer, R, inner;
-  if (k && !half_to_float && self.numel() > 0 && softmax_dims(self, dim, outer, R, inner)) {
-    at::Tensor x = contig(self);
-    at::Tensor out = at::empty(x.sizes(), x.options());
-    SoftmaxPush P{addr_of(x), addr_of(out), 0, outer, R, inner, 0};
-    dispatch(std::string("softmax_fwd_") + k, &P, sizeof(P), (uint64_t)outer * inner, 1, "aten::_softmax");
-    return out;
-  }
+  if (!softmax_dims(self, dim, outer, R, inner)) return std::nullopt;
+  at::Tensor x = contig(self.scalar_type() == dt ? self : self.to(dt));
+  at::Tensor out = at::empty(x.sizes(), x.options());
+  SoftmaxPush P{addr_of(x), addr_of(out), 0, outer, R, inner, safe ? 1u : 0u};
+  dispatch(std::string("softmax_fwd_") + k, &P, sizeof(P), (uint64_t)outer * inner, 1, aten_name);
+  return out;
+}
+
+at::Tensor k_softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
+  // half_to_float: 半精度の入力を fp32 で計算して fp32 を返す
+  std::optional<at::ScalarType> dt = half_to_float ? std::optional<at::ScalarType>(at::kFloat) : std::nullopt;
+  if (auto r = try_softmax(self, dim, dt, false, "aten::_softmax")) return *r;
   return VKT_FALLBACK(_softmax, self, dim, half_to_float);
+}
+
+at::Tensor k_safe_softmax(const at::Tensor& self, int64_t dim, std::optional<at::ScalarType> dtype) {
+  if (auto r = try_softmax(self, dim, dtype, true, "aten::_safe_softmax")) return *r;
+  return VKT_FALLBACK(_safe_softmax, self, dim, dtype);
 }
 
 at::Tensor k_softmax_backward(const at::Tensor& g, const at::Tensor& y, int64_t dim, at::ScalarType input_dtype) {
   const char* k = (is_vk(g) && is_vk(y)) ? fkind(y.scalar_type()) : nullptr;
   uint32_t outer, R, inner;
-  if (k && g.scalar_type() == y.scalar_type() && input_dtype == y.scalar_type() && g.sizes() == y.sizes() && y.numel() > 0 &&
+  if (k && fkind(g.scalar_type()) && fkind(input_dtype) && g.sizes() == y.sizes() && y.numel() > 0 &&
       softmax_dims(y, dim, outer, R, inner)) {
-    at::Tensor gc = contig(g), yc = contig(y);
+    // 計算は y の dtype で行い、結果を input_dtype（元の入力の dtype）へ変換する
+    at::Tensor gc = contig(g.scalar_type() == y.scalar_type() ? g : g.to(y.scalar_type()));
+    at::Tensor yc = contig(y);
     at::Tensor dx = at::empty(yc.sizes(), yc.options());
     SoftmaxPush P{addr_of(dx), addr_of(yc), addr_of(gc), outer, R, inner, 0};
     dispatch(std::string("softmax_bwd_") + k, &P, sizeof(P), (uint64_t)outer * inner, 1, "aten::_softmax_backward_data");
-    return dx;
+    return input_dtype == dx.scalar_type() ? dx : dx.to(input_dtype);
   }
   return VKT_FALLBACK(_softmax_backward_data, g, y, dim, input_dtype);
 }
@@ -318,6 +335,7 @@ at::Tensor k_cat(const at::ITensorListRef& tensors, int64_t dim) {
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_softmax", &k_softmax);
+  m.impl("_safe_softmax", &k_safe_softmax);
   m.impl("_softmax_backward_data", &k_softmax_backward);
   m.impl("native_layer_norm", &k_native_layer_norm);
   m.impl("native_layer_norm_backward", &k_native_layer_norm_backward);
