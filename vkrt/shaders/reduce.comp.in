@@ -1,0 +1,40 @@
+// sum / mean（除数 div で割る）。1 出力要素につき 1 ワークグループ。保持次元 4・縮約次元 2 までのストライド対応。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t x;
+    uint64_t out_;
+    uint n_out;
+    uint n_red;
+    uint ksz[4];
+    uint kst[4];
+    uint rsz[2];
+    uint rst[2];
+    float div_;
+    uint pad;
+} p;  // 合計 80 バイト
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint o = gl_WorkGroupID.x;
+    // 保持次元の座標 -> 入力オフセット
+    uint rem = o;
+    uint base = 0u;
+    for (int d = 3; d >= 0; --d) {
+        uint idx = rem % p.ksz[d];
+        rem /= p.ksz[d];
+        base += idx * p.kst[d];
+    }
+    float s = 0.0;
+    for (uint r = t; r < p.n_red; r += 256u) {
+        uint i1 = r % p.rsz[1];
+        uint i0 = r / p.rsz[1];
+        s += ldK(p.x, base + i0 * p.rst[0] + i1 * p.rst[1]);
+    }
+    s = block_sum(s);
+    if (t == 0u) stK(p.out_, o, s / p.div_);
+}

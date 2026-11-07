@@ -17,7 +17,9 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -61,6 +63,11 @@ void count_kernel(const std::string& name) {
 
 // ---- CPU フォールバック ------------------------------------------------------------------------
 void vulkan_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  // デバッグ用: VKT_TRACE_FALLBACK=1 でフォールバックした演算のスキーマ(オーバーロード込み)を stderr に出す
+  static const bool trace = std::getenv("VKT_TRACE_FALLBACK") != nullptr;
+  if (trace) {
+    std::cerr << "[vkt fallback] " << op.schema() << std::endl;
+  }
   count_fallback(op.schema().operator_name().name);
   at::native::cpu_fallback(op, stack);
 }

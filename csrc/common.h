@@ -38,4 +38,8 @@ int kernel_index(const std::string& name);
 #define VKT_FALLBACK(op, ...) \
   at::native::call_fallback_fn<&vkt::vulkan_fallback, at::_ops::op>::call(__VA_ARGS__)
 
+// SymInt 引数を持つ演算用（native_layer_norm など）
+#define VKT_FALLBACK_SYMINT(op, ...) \
+  at::native::call_fallback_fn_symint<&vkt::vulkan_fallback, at::_ops::op>::call(__VA_ARGS__)
+
 }  // namespace vkt

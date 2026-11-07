@@ -18,6 +18,16 @@ SDK = os.environ.get("VULKAN_SDK", r"C:\VulkanSDK\1.4.363.0")
 GLSLC = os.path.join(SDK, "Bin", "glslc.exe")
 SPIRV_VAL = os.path.join(SDK, "Bin", "spirv-val.exe")
 PUSH_SIZE = 152  # ew.comp.in の push constant ブロックのバイト数（C++ 側の構造体と一致させる）
+MM_PUSH_SIZE = 112  # mm.comp.in
+# 行単位カーネル: (テンプレート, 名前の接頭辞, MODE or None, push constant バイト数)
+ROW_KERNELS = [
+    ("softmax.comp.in", "softmax_fwd", 0, 40),
+    ("softmax.comp.in", "softmax_bwd", 1, 40),
+    ("ln.comp.in", "ln_fwd", 0, 72),
+    ("ln.comp.in", "ln_bwd", 1, 72),
+    ("ln.comp.in", "ln_wgrad", 2, 72),
+    ("reduce.comp.in", "reduce", None, 80),
+]
 
 KIND = {"f32": 0, "bf16": 1, "f16": 2, "u8": 3}
 FLOATS = ["f32", "bf16", "f16"]
@@ -96,27 +106,53 @@ def compile_one(name, expr, a, b, c, o):
             defs.append(f"-DHAS_{tag}")
     src = os.path.join(SHADERS, "ew.comp.in")
     dst = os.path.join(GEN, f"{name}.spv")
-    cmd = [GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.3", "-O", *defs, src, "-o", dst]
+    cmd = [GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.3", "-O", f"-I{SHADERS}", *defs, src, "-o", dst]
     subprocess.run(cmd, check=True)
     subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.3", dst], check=True)
 
 
+def compile_mm(dt):
+    name = f"mm_{dt}"
+    src = os.path.join(SHADERS, "mm.comp.in")
+    dst = os.path.join(GEN, f"{name}.spv")
+    subprocess.run([GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.3", "-O", f"-I{SHADERS}", f"-DKIND={KIND[dt]}", src, "-o", dst], check=True)
+    subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.3", dst], check=True)
+    return name
+
+
+def compile_row(template, prefix, mode, dt):
+    name = f"{prefix}_{dt}"
+    src = os.path.join(SHADERS, template)
+    dst = os.path.join(GEN, f"{name}.spv")
+    defs = [f"-DKIND={KIND[dt]}"] + ([f"-DMODE={mode}"] if mode is not None else [])
+    subprocess.run([GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.3", "-O", f"-I{SHADERS}", *defs, src, "-o", dst], check=True)
+    subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.3", dst], check=True)
+    return name
+
+
 def main():
     os.makedirs(GEN, exist_ok=True)
-    vs = variants()
-    for v in vs:
+    entries = []  # (name, push_size)
+    for v in variants():
         compile_one(*v)
+        entries.append((v[0], PUSH_SIZE))
+    for dt in FLOATS:
+        entries.append((compile_mm(dt), MM_PUSH_SIZE))
+    for template, prefix, mode, size in ROW_KERNELS:
+        for dt in FLOATS:
+            entries.append((compile_row(template, prefix, mode, dt), size))
     lines = [
         "// 自動生成: tools/gen_shaders.py。手で編集しない。",
         f"pub const EW_PUSH_SIZE: u32 = {PUSH_SIZE};",
+        f"pub const MM_PUSH_SIZE: u32 = {MM_PUSH_SIZE};",
         "pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[",
     ]
-    for name, *_ in vs:
-        lines.append(f'    ("{name}", include_bytes!("../shaders/gen/{name}.spv"), {PUSH_SIZE}),')
+    for name, size in entries:
+        lines.append(f'    ("{name}", include_bytes!("../shaders/gen/{name}.spv"), {size}),')
     lines.append("];")
     with open(os.path.join(ROOT, "vkrt", "src", "kernels_gen.rs"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"generated {len(vs)} kernels")
+    print(f"generated {len(entries)} kernels")
 
 
 if __name__ == "__main__":

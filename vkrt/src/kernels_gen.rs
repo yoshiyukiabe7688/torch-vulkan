@@ -1,5 +1,6 @@
 // 自動生成: tools/gen_shaders.py。手で編集しない。
 pub const EW_PUSH_SIZE: u32 = 152;
+pub const MM_PUSH_SIZE: u32 = 112;
 pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[
     ("ew_add_f32_f32_f32", include_bytes!("../shaders/gen/ew_add_f32_f32_f32.spv"), 152),
     ("ew_add_f32_bf16_f32", include_bytes!("../shaders/gen/ew_add_f32_bf16_f32.spv"), 152),
@@ -119,4 +120,25 @@ pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[
     ("ew_cast_u8_bf16", include_bytes!("../shaders/gen/ew_cast_u8_bf16.spv"), 152),
     ("ew_cast_u8_f16", include_bytes!("../shaders/gen/ew_cast_u8_f16.spv"), 152),
     ("ew_cast_u8_u8", include_bytes!("../shaders/gen/ew_cast_u8_u8.spv"), 152),
+    ("mm_f32", include_bytes!("../shaders/gen/mm_f32.spv"), 112),
+    ("mm_bf16", include_bytes!("../shaders/gen/mm_bf16.spv"), 112),
+    ("mm_f16", include_bytes!("../shaders/gen/mm_f16.spv"), 112),
+    ("softmax_fwd_f32", include_bytes!("../shaders/gen/softmax_fwd_f32.spv"), 40),
+    ("softmax_fwd_bf16", include_bytes!("../shaders/gen/softmax_fwd_bf16.spv"), 40),
+    ("softmax_fwd_f16", include_bytes!("../shaders/gen/softmax_fwd_f16.spv"), 40),
+    ("softmax_bwd_f32", include_bytes!("../shaders/gen/softmax_bwd_f32.spv"), 40),
+    ("softmax_bwd_bf16", include_bytes!("../shaders/gen/softmax_bwd_bf16.spv"), 40),
+    ("softmax_bwd_f16", include_bytes!("../shaders/gen/softmax_bwd_f16.spv"), 40),
+    ("ln_fwd_f32", include_bytes!("../shaders/gen/ln_fwd_f32.spv"), 72),
+    ("ln_fwd_bf16", include_bytes!("../shaders/gen/ln_fwd_bf16.spv"), 72),
+    ("ln_fwd_f16", include_bytes!("../shaders/gen/ln_fwd_f16.spv"), 72),
+    ("ln_bwd_f32", include_bytes!("../shaders/gen/ln_bwd_f32.spv"), 72),
+    ("ln_bwd_bf16", include_bytes!("../shaders/gen/ln_bwd_bf16.spv"), 72),
+    ("ln_bwd_f16", include_bytes!("../shaders/gen/ln_bwd_f16.spv"), 72),
+    ("ln_wgrad_f32", include_bytes!("../shaders/gen/ln_wgrad_f32.spv"), 72),
+    ("ln_wgrad_bf16", include_bytes!("../shaders/gen/ln_wgrad_bf16.spv"), 72),
+    ("ln_wgrad_f16", include_bytes!("../shaders/gen/ln_wgrad_f16.spv"), 72),
+    ("reduce_f32", include_bytes!("../shaders/gen/reduce_f32.spv"), 80),
+    ("reduce_bf16", include_bytes!("../shaders/gen/reduce_bf16.spv"), 80),
+    ("reduce_f16", include_bytes!("../shaders/gen/reduce_f16.spv"), 80),
 ];

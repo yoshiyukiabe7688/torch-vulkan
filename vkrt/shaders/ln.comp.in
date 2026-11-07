@@ -1,0 +1,84 @@
+// layer_norm（最後の D 要素を正規化。入力は [rows, D] の連続メモリ）。
+// MODE 0: forward   y = (x - mean) * rstd * w + b、mean / rstd を f32 で出力
+// MODE 1: backward  dx = rstd * (dxhat - mean(dxhat) - xhat * mean(dxhat * xhat)), dxhat = g * w
+// MODE 2: weight / bias の勾配 (列ごと): dw[d] = sum_rows g * xhat、db[d] = sum_rows g
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t x;      // 入力 x
+    uint64_t y;      // MODE0: 出力 y / MODE1: 出力 dx / MODE2: 出力 dw
+    uint64_t g;      // grad_out（MODE1, 2）
+    uint64_t mean;   // f32 [rows]
+    uint64_t rstd;   // f32 [rows]
+    uint64_t w;      // weight [D]（無ければ 0）
+    uint64_t b;      // MODE0: bias [D] / MODE2: 出力 db
+    uint rows;
+    uint D;
+    float eps;
+    uint pad;
+} p;  // 合計 72 バイト
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#if MODE == 2
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= p.D) return;
+    float dw = 0.0, db = 0.0;
+    for (uint r = 0u; r < p.rows; ++r) {
+        float gv = ldK(p.g, r * p.D + d);
+        float xhat = (ldK(p.x, r * p.D + d) - ldF(p.mean, r)) * ldF(p.rstd, r);
+        dw += gv * xhat;
+        db += gv;
+    }
+    if (p.y != 0ul) stK(p.y, d, dw);
+    if (p.b != 0ul) stK(p.b, d, db);
+#else
+    uint row = gl_WorkGroupID.x;
+    uint base = row * p.D;
+#if MODE == 0
+    float s = 0.0;
+    for (uint i = t; i < p.D; i += 256u) s += ldK(p.x, base + i);
+    float mean = block_sum(s) / float(p.D);
+    float v = 0.0;
+    for (uint i = t; i < p.D; i += 256u) {
+        float c = ldK(p.x, base + i) - mean;
+        v += c * c;
+    }
+    float var_ = block_sum(v) / float(p.D);
+    float rstd = inversesqrt(var_ + p.eps);
+    for (uint i = t; i < p.D; i += 256u) {
+        float o = (ldK(p.x, base + i) - mean) * rstd;
+        if (p.w != 0ul) o *= ldK(p.w, i);
+        if (p.b != 0ul) o += ldK(p.b, i);
+        stK(p.y, base + i, o);
+    }
+    if (t == 0u) {
+        stF(p.mean, row, mean);
+        stF(p.rstd, row, rstd);
+    }
+#else
+    float mean = ldF(p.mean, row);
+    float rstd = ldF(p.rstd, row);
+    float s1 = 0.0, s2 = 0.0;
+    for (uint i = t; i < p.D; i += 256u) {
+        float dxhat = ldK(p.g, base + i);
+        if (p.w != 0ul) dxhat *= ldK(p.w, i);
+        float xhat = (ldK(p.x, base + i) - mean) * rstd;
+        s1 += dxhat;
+        s2 += dxhat * xhat;
+    }
+    s1 = block_sum(s1) / float(p.D);
+    s2 = block_sum(s2) / float(p.D);
+    for (uint i = t; i < p.D; i += 256u) {
+        float dxhat = ldK(p.g, base + i);
+        if (p.w != 0ul) dxhat *= ldK(p.w, i);
+        float xhat = (ldK(p.x, base + i) - mean) * rstd;
+        stK(p.y, base + i, rstd * (dxhat - s1 - xhat * s2));
+    }
+#endif
+#endif
+}

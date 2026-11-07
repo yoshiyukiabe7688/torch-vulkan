@@ -1,0 +1,51 @@
+// softmax の forward / backward。入力は連続で [outer, R, inner] と見なし、R 方向に正規化する（dim が末尾なら inner=1）。
+// MODE 0: y = softmax(x)               (x -> p.x, 出力 -> p.y)
+// MODE 1: dx = y * (g - sum(g * y))    (y -> p.y, g -> p.g, 出力 dx -> p.x)
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t x;
+    uint64_t y;
+    uint64_t g;
+    uint outer;
+    uint R;
+    uint inner;
+    uint pad;
+} p;  // 合計 40 バイト
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint o = row / p.inner;
+    uint i = row % p.inner;
+    uint base = o * p.R * p.inner + i;
+    uint stride = p.inner;
+#if MODE == 0
+    float m = -3.402823466e+38;
+    for (uint r = t; r < p.R; r += 256u) m = max(m, ldK(p.x, base + r * stride));
+    m = block_max(m);
+    float s = 0.0;
+    for (uint r = t; r < p.R; r += 256u) s += exp(ldK(p.x, base + r * stride) - m);
+    s = block_sum(s);
+    for (uint r = t; r < p.R; r += 256u) {
+        uint idx = base + r * stride;
+        stK(p.y, idx, exp(ldK(p.x, idx) - m) / s);
+    }
+#else
+    float d = 0.0;
+    for (uint r = t; r < p.R; r += 256u) {
+        uint idx = base + r * stride;
+        d += ldK(p.g, idx) * ldK(p.y, idx);
+    }
+    d = block_sum(d);
+    for (uint r = t; r < p.R; r += 256u) {
+        uint idx = base + r * stride;
+        float yv = ldK(p.y, idx);
+        stK(p.x, idx, yv * (ldK(p.g, idx) - d));
+    }
+#endif
+}

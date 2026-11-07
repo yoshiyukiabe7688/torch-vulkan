@@ -1,0 +1,126 @@
+// バッチ付き行列積 C[b] = alpha * A[b] @ B[b] + beta * bias（タイル型・共有メモリ・fp32 累積）。
+// A, B, C, bias は任意ストライド（転置はコピー無しで直接読む）。dtype は KIND 値（0=f32, 1=bf16, 2=f16）。
+// サブグループ演算は使わない。協調行列版は別カーネルとして後で追加する。
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer RF32 { float v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RBF16 { uint16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RF16 { float16_t v[]; };
+
+layout(push_constant, scalar) uniform P {
+    uint64_t a;
+    uint64_t b;
+    uint64_t c;
+    uint64_t bias;
+    uint M, N, K, batch;
+    uint a_sb, a_sm, a_sk;      // A の stride（要素単位）: バッチ / 行 / 列
+    uint b_sb, b_sk, b_sn;
+    uint c_sb, c_sm, c_sn;
+    uint bias_sb, bias_sm, bias_sn;  // bias はブロードキャスト（stride 0）可
+    float alpha, beta;
+    uint has_bias;
+    uint pad;
+} p;  // 合計 112 バイト
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared float As[BK][BM];
+shared float Bs[BK][BN];
+
+float bf2f(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
+uint16_t f2bf(float x) {
+    if (isnan(x)) return uint16_t(0x7FC0u);
+    uint u = floatBitsToUint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return uint16_t(u >> 16);
+}
+
+#if KIND == 0
+float ld(uint64_t base, uint i) { return RF32(base).v[i]; }
+void st(uint64_t base, uint i, float x) { RF32(base).v[i] = x; }
+#elif KIND == 1
+float ld(uint64_t base, uint i) { return bf2f(RBF16(base).v[i]); }
+void st(uint64_t base, uint i, float x) { RBF16(base).v[i] = f2bf(x); }
+#else
+float ld(uint64_t base, uint i) { return float(RF16(base).v[i]); }
+void st(uint64_t base, uint i, float x) { RF16(base).v[i] = float16_t(x); }
+#endif
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;   // 0..15 (N 方向)
+    const uint ty = gl_LocalInvocationID.y;   // 0..15 (M 方向)
+    const uint tid = ty * 16 + tx;            // 0..255
+    const uint row0 = gl_WorkGroupID.y * BM;
+    const uint col0 = gl_WorkGroupID.x * BN;
+    const uint bz = gl_WorkGroupID.z;
+
+    const uint a_base = bz * p.a_sb;
+    const uint b_base = bz * p.b_sb;
+
+    float acc[TM][TN];
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < TN; ++j) acc[i][j] = 0.0;
+
+    // A がメモリ上で k 方向に連続なら k を速い軸に、そうでなければ m を速い軸にしてコアレスさせる
+    const bool a_k_fast = (p.a_sk == 1u);
+    const bool b_n_fast = (p.b_sn == 1u);
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        // A タイル (BM x BK = 1024 要素) を 256 スレッドで 4 要素ずつ
+        for (uint e = 0; e < 4; ++e) {
+            uint idx = tid + e * 256u;
+            uint m, k;
+            if (a_k_fast) { k = idx % BK; m = idx / BK; } else { m = idx % BM; k = idx / BM; }
+            uint gm = row0 + m, gk = k0 + k;
+            float v = 0.0;
+            if (gm < p.M && gk < p.K) v = ld(p.a, a_base + gm * p.a_sm + gk * p.a_sk);
+            As[k][m] = v;
+        }
+        // B タイル (BK x BN = 1024 要素)
+        for (uint e = 0; e < 4; ++e) {
+            uint idx = tid + e * 256u;
+            uint n, k;
+            if (b_n_fast) { n = idx % BN; k = idx / BN; } else { k = idx % BK; n = idx / BK; }
+            uint gn = col0 + n, gk = k0 + k;
+            float v = 0.0;
+            if (gn < p.N && gk < p.K) v = ld(p.b, b_base + gk * p.b_sk + gn * p.b_sn);
+            Bs[k][n] = v;
+        }
+        barrier();
+        for (uint k = 0; k < BK; ++k) {
+            float ra[TM];
+            float rb[TN];
+            for (uint i = 0; i < TM; ++i) ra[i] = As[k][ty * TM + i];
+            for (uint j = 0; j < TN; ++j) rb[j] = Bs[k][tx * TN + j];
+            for (uint i = 0; i < TM; ++i)
+                for (uint j = 0; j < TN; ++j) acc[i][j] += ra[i] * rb[j];
+        }
+        barrier();
+    }
+
+    const uint c_base = bz * p.c_sb;
+    const uint bias_base = bz * p.bias_sb;
+    for (uint i = 0; i < TM; ++i) {
+        uint gm = row0 + ty * TM + i;
+        if (gm >= p.M) continue;
+        for (uint j = 0; j < TN; ++j) {
+            uint gn = col0 + tx * TN + j;
+            if (gn >= p.N) continue;
+            float r = p.alpha * acc[i][j];
+            if (p.has_bias != 0u) r += p.beta * ld(p.bias, bias_base + gm * p.bias_sm + gn * p.bias_sn);
+            st(p.c, c_base + gm * p.c_sm + gn * p.c_sn, r);
+        }
+    }
+}
