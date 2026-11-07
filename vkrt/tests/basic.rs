@@ -2,13 +2,18 @@
 use std::ffi::c_void;
 use vkrt::*;
 
-fn init() {
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// ランタイムはプロセス全体で 1 つ（統計もグローバル）なので、テストを直列化する。
+fn init() -> std::sync::MutexGuard<'static, ()> {
+    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(vkrt_init(), 0, "init 失敗");
+    g
 }
 
 #[test]
 fn upload_download_roundtrip_and_d2d() {
-    init();
+    let _g = init();
     let n = 1000usize;
     let src: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
     let a = vkrt_alloc((n * 4) as u64);
@@ -31,7 +36,7 @@ fn upload_download_roundtrip_and_d2d() {
 
 #[test]
 fn large_transfer_exceeds_staging_size() {
-    init();
+    let _g = init();
     let n = (40usize << 20) / 4; // 40MB > ステージング 16MB
     let src: Vec<f32> = (0..n).map(|i| (i % 1000) as f32).collect();
     let a = vkrt_alloc((n * 4) as u64);
@@ -46,7 +51,7 @@ fn large_transfer_exceeds_staging_size() {
 
 #[test]
 fn add_f32_kernel_matches_cpu() {
-    init();
+    let _g = init();
     let n = 100_003usize; // 256 の倍数でない
     let x: Vec<f32> = (0..n).map(|i| (i as f32).sin()).collect();
     let y: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).cos()).collect();
@@ -72,7 +77,7 @@ fn add_f32_kernel_matches_cpu() {
 
 #[test]
 fn out_of_range_and_unknown_addresses_are_rejected() {
-    init();
+    let _g = init();
     let a = vkrt_alloc(64);
     let mut buf = [0u8; 128];
     unsafe {
@@ -86,7 +91,7 @@ fn out_of_range_and_unknown_addresses_are_rejected() {
 
 #[test]
 fn allocation_above_device_limit_fails() {
-    init();
+    let _g = init();
     let limit = vkrt_max_alloc();
     assert!(limit > 0);
     assert_eq!(vkrt_alloc(limit + 1), 0);
@@ -96,7 +101,7 @@ fn allocation_above_device_limit_fails() {
 /// 最後に走らせるのではなく、ここでも一通りの操作をしてから確認する。
 #[test]
 fn no_validation_errors() {
-    init();
+    let _g = init();
     let a = vkrt_alloc(4096);
     let b = vkrt_alloc(4096);
     let data = [1u8; 4096];
@@ -111,4 +116,67 @@ fn no_validation_errors() {
     vkrt_free(a);
     vkrt_free(b);
     assert_eq!(vkrt_validation_errors(), 0);
+}
+
+#[test]
+fn many_small_allocations_do_not_hit_driver_allocation_limit() {
+    let _g = init();
+    // ドライバの割り当て上限（約 4096）を大きく超える数の小ブロックを同時に保持できること
+    let slabs_before = vkrt_slab_count();
+    let addrs: Vec<u64> = (0..20_000).map(|i| vkrt_alloc(1000 + (i % 7) * 100)).collect();
+    assert!(addrs.iter().all(|&a| a != 0));
+    assert!(vkrt_slab_count() - slabs_before < 20, "スラブ数が多すぎる: {}", vkrt_slab_count());
+    // アドレスの重複が無いこと
+    let mut sorted = addrs.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), addrs.len());
+    for a in addrs {
+        assert_eq!(vkrt_free(a), 0);
+    }
+}
+
+#[test]
+fn freed_neighbours_are_coalesced_and_data_is_isolated() {
+    let _g = init();
+    let a = vkrt_alloc(4096);
+    let b = vkrt_alloc(4096);
+    let c = vkrt_alloc(4096);
+    let (da, dc) = ([0xAAu8; 4096], [0xCCu8; 4096]);
+    unsafe {
+        vkrt_upload(a, da.as_ptr() as *const c_void, 4096);
+        vkrt_upload(c, dc.as_ptr() as *const c_void, 4096);
+    }
+    // a と c の間の b を解放して、より大きなブロックを確保しても a, c が壊れない
+    vkrt_free(b);
+    let big = vkrt_alloc(8192);
+    let bigdata = [0x55u8; 8192];
+    unsafe {
+        vkrt_upload(big, bigdata.as_ptr() as *const c_void, 8192);
+        let (mut ra, mut rc) = ([0u8; 4096], [0u8; 4096]);
+        vkrt_download(ra.as_mut_ptr() as *mut c_void, a, 4096);
+        vkrt_download(rc.as_mut_ptr() as *mut c_void, c, 4096);
+        assert!(ra == da && rc == dc, "隣接ブロックが破壊された");
+    }
+    vkrt_free(a);
+    vkrt_free(c);
+    vkrt_free(big);
+    // 返却後は隣接空きが結合されているので、元の合計サイズの連続領域を取れる
+    let all = vkrt_alloc(3 * 4096 + 8192);
+    assert!(all != 0);
+    vkrt_free(all);
+}
+
+#[test]
+fn empty_cache_returns_idle_slabs_and_large_blocks_are_dedicated() {
+    let _g = init();
+    let big = vkrt_alloc(100 << 20); // 専用スラブ
+    assert!(big != 0);
+    let reserved = vkrt_reserved_bytes();
+    assert!(reserved >= 100 << 20);
+    vkrt_free(big); // 専用スラブは解放時にドライバへ返る
+    assert!(vkrt_reserved_bytes() < reserved);
+    let small = vkrt_alloc(1024);
+    vkrt_free(small);
+    assert!(vkrt_empty_cache() >= 1, "空きスラブが返却されない");
 }

@@ -68,7 +68,19 @@ def validation_errors() -> int:
 
 
 def empty_cache() -> None:
-    return None
+    _C.empty_cache()  # 完全に空いたスラブをドライバへ返す
+
+
+def reserved_bytes() -> int:
+    return _C.reserved_bytes()
+
+
+def live_blocks() -> int:
+    return _C.live_blocks()
+
+
+def slab_count() -> int:
+    return _C.slab_count()
 
 
 def manual_seed(seed: int) -> None:

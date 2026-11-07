@@ -23,10 +23,28 @@ const STAGING_BYTES: u64 = 16 << 20;
 const PUSH_MAX: u32 = 128;
 const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-struct Alloc {
+const ALIGN: u64 = 512;
+const SLAB_BYTES: u64 = 256 << 20;
+/// これ以上の要求は専用バッファにする（解放時にドライバへ返す）。
+const DEDICATED_MIN: u64 = 64 << 20;
+
+/// デバイスメモリ 1 枚（1 つの VkBuffer）。内部をサブアロケートする。
+struct Slab {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: u64,
+    dedicated: bool,
+    used: u64,
+    /// 空き領域: オフセット -> 長さ（隣接は結合済み）
+    free: BTreeMap<u64, u64>,
+}
+
+/// 利用者に渡したブロック。
+struct Block {
+    /// 丸めた後のサイズ（スラブ内で実際に占有する量）
+    size: u64,
+    /// 利用者が要求したサイズ。範囲検査はこちらで行う（パディングへのアクセスも検出する）。
+    req: u64,
 }
 
 struct Kernel {
@@ -51,7 +69,8 @@ struct Runtime {
     fence: vk::Fence,
     layout: vk::PipelineLayout,
     kernels: Vec<Kernel>,
-    allocs: BTreeMap<u64, Alloc>,
+    slabs: BTreeMap<u64, Slab>,
+    blocks: BTreeMap<u64, Block>,
     staging: Staging,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     mem_device_local: u32,
@@ -246,7 +265,8 @@ impl Runtime {
                 fence,
                 layout,
                 kernels,
-                allocs: BTreeMap::new(),
+                slabs: BTreeMap::new(),
+                blocks: BTreeMap::new(),
                 staging: Staging { buffer: sbuf, memory: smem, ptr: sptr, size: STAGING_BYTES },
                 mem_props,
                 mem_device_local,
@@ -277,13 +297,8 @@ impl Runtime {
         Ok(())
     }
 
-    fn alloc(&mut self, size: u64) -> R<u64> {
-        if size == 0 {
-            return Err("サイズ 0 の割り当て".into());
-        }
-        if size > self.max_alloc {
-            return Err(format!("割り当てサイズ {size} が maxMemoryAllocationSize {} を超えています", self.max_alloc));
-        }
+    /// 新しいスラブ（1 つの VkBuffer + VkDeviceMemory）を作る。
+    fn new_slab(&mut self, size: u64, dedicated: bool) -> R<u64> {
         unsafe {
             let d = &self.device;
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER
@@ -294,7 +309,6 @@ impl Runtime {
                 .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
                 .map_err(vkerr("create_buffer"))?;
             let req = d.get_buffer_memory_requirements(buffer);
-            // バッファが許すメモリタイプのうち DEVICE_LOCAL を選ぶ
             let ty = find_memory_type(&self.mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 .unwrap_or(self.mem_device_local);
             let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
@@ -308,31 +322,131 @@ impl Runtime {
                     format!("allocate_memory({} bytes): {e:?}", req.size)
                 })?;
             d.bind_buffer_memory(buffer, memory, 0).map_err(vkerr("bind_buffer_memory"))?;
-            let addr = d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
-            self.allocs.insert(addr, Alloc { buffer, memory, size });
-            self.live_bytes += size;
-            Ok(addr)
+            let base = d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            let mut free = BTreeMap::new();
+            free.insert(0, size);
+            self.slabs.insert(base, Slab { buffer, memory, size, dedicated, used: 0, free });
+            Ok(base)
+        }
+    }
+
+    /// 既存スラブの空きから best-fit で切り出す。
+    fn carve(&mut self, rounded: u64) -> Option<u64> {
+        for (base, slab) in self.slabs.iter_mut() {
+            if slab.dedicated || slab.size - slab.used < rounded {
+                continue;
+            }
+            let best = slab.free.iter().filter(|&(_, &len)| len >= rounded).min_by_key(|&(_, &len)| len).map(|(&o, &l)| (o, l));
+            if let Some((off, len)) = best {
+                slab.free.remove(&off);
+                if len > rounded {
+                    slab.free.insert(off + rounded, len - rounded);
+                }
+                slab.used += rounded;
+                return Some(base + off);
+            }
+        }
+        None
+    }
+
+    fn alloc(&mut self, size: u64) -> R<u64> {
+        if size == 0 {
+            return Err("サイズ 0 の割り当て".into());
+        }
+        let rounded = size.div_ceil(ALIGN) * ALIGN;
+        if rounded > self.max_alloc {
+            return Err(format!("割り当てサイズ {size} が maxMemoryAllocationSize {} を超えています", self.max_alloc));
+        }
+        let addr = if rounded >= DEDICATED_MIN {
+            let base = self.new_slab_with_retry(rounded, true)?;
+            let slab = self.slabs.get_mut(&base).unwrap();
+            slab.free.clear();
+            slab.used = rounded;
+            base
+        } else if let Some(a) = self.carve(rounded) {
+            a
+        } else {
+            self.new_slab_with_retry(SLAB_BYTES, false)?;
+            self.carve(rounded).ok_or("スラブ作成直後の割り当てに失敗")?
+        };
+        self.blocks.insert(addr, Block { size: rounded, req: size });
+        self.live_bytes += rounded;
+        Ok(addr)
+    }
+
+    /// OOM のときは空きスラブを返却して 1 回だけ再試行する。
+    fn new_slab_with_retry(&mut self, size: u64, dedicated: bool) -> R<u64> {
+        match self.new_slab(size, dedicated) {
+            Ok(b) => Ok(b),
+            Err(first) => {
+                if self.empty_cache() == 0 {
+                    return Err(first);
+                }
+                let live = self.live_bytes;
+                self.new_slab(size, dedicated).map_err(|e| format!("{e}（空きスラブ返却後も失敗。確保中 {live} bytes）"))
+            }
         }
     }
 
     fn free(&mut self, addr: u64) -> R<()> {
-        let a = self.allocs.remove(&addr).ok_or_else(|| format!("未知のアドレス {addr:#x} の free"))?;
-        unsafe {
-            self.device.destroy_buffer(a.buffer, None);
-            self.device.free_memory(a.memory, None);
+        let blk = self.blocks.remove(&addr).ok_or_else(|| format!("未知のアドレス {addr:#x} の free"))?;
+        let (&base, _) = self.slabs.range(..=addr).next_back().ok_or("スラブが見つかりません")?;
+        let slab = self.slabs.get_mut(&base).unwrap();
+        slab.used -= blk.size;
+        self.live_bytes -= blk.size;
+        if slab.dedicated {
+            let slab = self.slabs.remove(&base).unwrap();
+            unsafe {
+                self.device.destroy_buffer(slab.buffer, None);
+                self.device.free_memory(slab.memory, None);
+            }
+            return Ok(());
         }
-        self.live_bytes -= a.size;
+        // 空きリストへ戻し、前後の空きと結合する
+        let mut off = addr - base;
+        let mut len = blk.size;
+        if let Some((&po, &pl)) = slab.free.range(..off).next_back() {
+            if po + pl == off {
+                slab.free.remove(&po);
+                off = po;
+                len += pl;
+            }
+        }
+        if let Some((&no, &nl)) = slab.free.range(off + len..).next() {
+            if no == off + len {
+                slab.free.remove(&no);
+                len += nl;
+            }
+        }
+        slab.free.insert(off, len);
         Ok(())
     }
 
-    /// アドレス範囲 [addr, addr+len) を含む割り当てを探し、(buffer, buffer 内オフセット) を返す。
-    fn resolve(&self, addr: u64, len: u64) -> R<(vk::Buffer, u64)> {
-        let (base, a) = self.allocs.range(..=addr).next_back().ok_or_else(|| format!("未知のアドレス {addr:#x}"))?;
-        let off = addr - base;
-        if off + len > a.size {
-            return Err(format!("範囲外アクセス: addr={addr:#x} len={len} (割り当て {base:#x} サイズ {})", a.size));
+    /// 完全に空いたスラブをドライバへ返す。返したスラブ数を返す。
+    fn empty_cache(&mut self) -> usize {
+        let empty: Vec<u64> = self.slabs.iter().filter(|(_, s)| s.used == 0).map(|(&b, _)| b).collect();
+        for b in &empty {
+            let slab = self.slabs.remove(b).unwrap();
+            unsafe {
+                self.device.destroy_buffer(slab.buffer, None);
+                self.device.free_memory(slab.memory, None);
+            }
         }
-        Ok((a.buffer, off))
+        empty.len()
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.slabs.values().map(|s| s.size).sum()
+    }
+
+    /// アドレス範囲 [addr, addr+len) が 1 つのブロックに収まることを確認し、(buffer, buffer 内オフセット) を返す。
+    fn resolve(&self, addr: u64, len: u64) -> R<(vk::Buffer, u64)> {
+        let (bbase, blk) = self.blocks.range(..=addr).next_back().ok_or_else(|| format!("未知のアドレス {addr:#x}"))?;
+        if addr + len > bbase + blk.req {
+            return Err(format!("範囲外アクセス: addr={addr:#x} len={len} (ブロック {bbase:#x} 要求サイズ {})", blk.req));
+        }
+        let (sbase, slab) = self.slabs.range(..=addr).next_back().ok_or("スラブが見つかりません")?;
+        Ok((slab.buffer, addr - sbase))
     }
 
     fn upload(&self, dst: u64, src: *const u8, n: u64) -> R<()> {
@@ -552,4 +666,28 @@ pub extern "C" fn vkrt_synchronize() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vkrt_validation_errors() -> usize {
     VALIDATION_ERRORS.load(Ordering::Relaxed)
+}
+
+/// 完全に空いたスラブをドライバへ返す（torch.vk.empty_cache 相当）。返したスラブ数。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_empty_cache() -> usize {
+    report(with_rt(|rt| Ok(rt.empty_cache())))
+}
+
+/// ドライバから確保済みのバイト数（スラブ合計。確保中 + キャッシュ）。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_reserved_bytes() -> u64 {
+    report(with_rt(|rt| Ok(rt.reserved_bytes())))
+}
+
+/// 利用者に渡して未解放のブロック数。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_live_blocks() -> usize {
+    report(with_rt(|rt| Ok(rt.blocks.len())))
+}
+
+/// スラブ数（= ドライバへの vkAllocateMemory の保持数）。
+#[unsafe(no_mangle)]
+pub extern "C" fn vkrt_slab_count() -> usize {
+    report(with_rt(|rt| Ok(rt.slabs.len())))
 }

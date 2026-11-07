@@ -339,6 +339,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("max_alloc", [] { ensure_init(); return vkrt_max_alloc(); });
   m.def("live_bytes", [] { ensure_init(); return vkrt_live_bytes(); });
   m.def("synchronize", [] { ensure_init(); vk_check(vkrt_synchronize(), "synchronize"); });
+  m.def("empty_cache", [] { ensure_init(); return vkrt_empty_cache(); });
+  m.def("reserved_bytes", [] { ensure_init(); return vkrt_reserved_bytes(); });
+  m.def("live_blocks", [] { ensure_init(); return vkrt_live_blocks(); });
+  m.def("slab_count", [] { ensure_init(); return vkrt_slab_count(); });
   m.def("validation_errors", [] { return vkrt_validation_errors(); });
   m.def("fallback_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);

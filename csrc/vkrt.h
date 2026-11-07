@@ -17,5 +17,9 @@ int vkrt_copy_d2d(uint64_t dst, uint64_t src, uint64_t n);
 int vkrt_kernel_index(const char* name);
 int vkrt_dispatch(uint32_t kernel, const void* push, uint32_t push_len, uint32_t gx, uint32_t gy, uint32_t gz);
 int vkrt_synchronize();
+size_t vkrt_empty_cache();
+uint64_t vkrt_reserved_bytes();
+size_t vkrt_live_blocks();
+size_t vkrt_slab_count();
 size_t vkrt_validation_errors();
 }
