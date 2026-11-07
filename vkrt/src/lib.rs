@@ -469,8 +469,9 @@ impl Runtime {
                 live_bytes: 0,
                 peak_live: 0,
                 mem_limit: 0,
-                slab_bytes: SLAB_BYTES,
-                dedicated_min: DEDICATED_MIN,
+                // 1 回の割り当て上限が小さいデバイスでは、スラブ（1 つの割り当て）もそれに収める
+                slab_bytes: SLAB_BYTES.min(max_alloc),
+                dedicated_min: DEDICATED_MIN.min(max_alloc / 2),
             })
         }
     }
@@ -1007,11 +1008,11 @@ pub extern "C" fn vkrt_set_memory_limit(bytes: u64) {
     let _ = with_rt(|rt| {
         rt.mem_limit = bytes;
         if bytes > 0 {
-            rt.slab_bytes = (256u64 << 20).min(bytes / 8).max(64 << 20); // 上限が小さいほどスラブも小さくして、詰まった所での確保失敗を避ける
+            rt.slab_bytes = (256u64 << 20).min(bytes / 8).max(64 << 20).min(rt.max_alloc); // 上限が小さいほどスラブも小さくして、詰まった所での確保失敗を避ける
             rt.dedicated_min = rt.slab_bytes / 2;
         } else {
-            rt.slab_bytes = SLAB_BYTES;
-            rt.dedicated_min = DEDICATED_MIN;
+            rt.slab_bytes = SLAB_BYTES.min(rt.max_alloc);
+            rt.dedicated_min = DEDICATED_MIN.min(rt.max_alloc / 2);
         }
         Ok(())
     });
