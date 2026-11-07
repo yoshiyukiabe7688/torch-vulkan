@@ -103,16 +103,19 @@ def test_add_2d_and_3d_shapes():
         assert torch.equal((a.to(dev) + b.to(dev)).cpu(), a + b)
 
 
-def test_add_falls_back_correctly_for_unsupported_cases():
+def test_add_handles_broadcast_scalar_alpha_and_half_on_gpu_and_falls_back_for_ints():
     a, b = torch.randn(4, 5), torch.randn(5)
     assert torch.equal((a.to(dev) + b.to(dev)).cpu(), a + b)  # ブロードキャスト
     assert torch.allclose((a.to(dev) + 2.5).cpu(), a + 2.5)  # スカラー
-    assert torch.equal((a.t().to(dev) + a.t().to(dev)).cpu(), a.t() + a.t())  # 同形状でも view は連続化されて GPU か fallback
+    assert torch.equal((a.t().to(dev) + a.t().to(dev)).cpu(), a.t() + a.t())  # 転置 view
     x = torch.randn(3, 3)
     assert torch.allclose(torch.add(x.to(dev), x.to(dev), alpha=2.0).cpu(), x + 2 * x)  # alpha != 1
     h = torch.randn(10).to(torch.float16)
-    assert torch.equal((h.to(dev) + h.to(dev)).cpu(), h + h)  # fp16 は未対応 -> fallback
-    assert torch_vulkan.fallback_counts().get("aten::add", 0) >= 4
+    assert torch.equal((h.to(dev) + h.to(dev)).cpu(), h + h)  # fp16
+    assert "aten::add" not in torch_vulkan.fallback_counts()  # 上のケースはすべて GPU カーネル
+    i = torch.arange(6)
+    assert torch.equal((i.to(dev) + i.to(dev)).cpu(), i + i)  # 整数は未対応 -> CPU フォールバックで正しく動く
+    assert torch_vulkan.fallback_counts().get("aten::add") == 1
 
 
 def test_add_autograd_through_gpu_kernel():

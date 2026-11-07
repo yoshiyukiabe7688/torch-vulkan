@@ -17,10 +17,19 @@ use std::{
 };
 
 /// 組み込みカーネル: (名前, SPIR-V, push constant のバイト数)
-const KERNEL_TABLE: &[(&str, &[u8], u32)] = &[("add_f32", include_bytes!("../shaders/add_f32.spv"), 32)];
+mod kernels_gen;
+
+/// 手書きカーネル: (名前, SPIR-V, push constant のバイト数)
+const BASE_KERNELS: &[(&str, &[u8], u32)] = &[("add_f32", include_bytes!("../shaders/add_f32.spv"), 32)];
+
+/// 全カーネル（手書き + tools/gen_shaders.py の生成物）。番号 = この並びの添字。
+fn kernel_table() -> &'static [(&'static str, &'static [u8], u32)] {
+    static T: OnceLock<Vec<(&'static str, &'static [u8], u32)>> = OnceLock::new();
+    T.get_or_init(|| BASE_KERNELS.iter().chain(kernels_gen::GEN_KERNELS.iter()).copied().collect())
+}
 
 const STAGING_BYTES: u64 = 16 << 20;
-const PUSH_MAX: u32 = 128;
+const PUSH_MAX: u32 = 256; // maxPushConstantsSize（AMD gfx1201 実測 256。起動時に実機の値と照合する）
 const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const ALIGN: u64 = 512;
@@ -48,7 +57,8 @@ struct Block {
 }
 
 struct Kernel {
-    pipeline: vk::Pipeline,
+    /// 初回の dispatch で作る（118 本以上を起動時に全部作らない）
+    pipeline: Option<vk::Pipeline>,
     push_size: u32,
 }
 
@@ -157,6 +167,12 @@ impl Runtime {
             let props = instance.get_physical_device_properties(pd);
             let device_name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
+            if props.limits.max_push_constants_size < PUSH_MAX {
+                return Err(format!(
+                    "maxPushConstantsSize={} が必要量 {PUSH_MAX} に足りません",
+                    props.limits.max_push_constants_size
+                ));
+            }
             let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut m3);
             instance.get_physical_device_properties2(pd, &mut p2);
@@ -173,6 +189,7 @@ impl Runtime {
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
                 .buffer_device_address(true)
                 .shader_float16(true)
+                .shader_int8(true)
                 .storage_buffer8_bit_access(true);
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
                 .features(vk::PhysicalDeviceFeatures::default().shader_int64(true).shader_int16(true))
@@ -234,26 +251,7 @@ impl Runtime {
             let layout = device
                 .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges), None)
                 .map_err(vkerr("パイプラインレイアウト"))?;
-            let mut kernels = Vec::new();
-            for (name, spv, push_size) in KERNEL_TABLE {
-                let words = ash::util::read_spv(&mut Cursor::new(*spv)).map_err(vkerr("SPIR-V 読み込み"))?;
-                let module = device
-                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-                    .map_err(vkerr(name))?;
-                let stage = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::COMPUTE)
-                    .module(module)
-                    .name(c"main");
-                let pipelines = device
-                    .create_compute_pipelines(
-                        vk::PipelineCache::null(),
-                        &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
-                        None,
-                    )
-                    .map_err(|(_, e)| format!("パイプライン {name}: {e:?}"))?;
-                device.destroy_shader_module(module, None);
-                kernels.push(Kernel { pipeline: pipelines[0], push_size: *push_size });
-            }
+            let kernels = kernel_table().iter().map(|(_, _, push_size)| Kernel { pipeline: None, push_size: *push_size }).collect();
 
             Ok(Runtime {
                 _entry: entry,
@@ -487,13 +485,40 @@ impl Runtime {
         })
     }
 
-    fn dispatch(&self, kernel: u32, push: &[u8], gx: u32, gy: u32, gz: u32) -> R<()> {
-        let k = self.kernels.get(kernel as usize).ok_or("不明なカーネル")?;
-        if push.len() as u32 != k.push_size || push.len() as u32 > PUSH_MAX {
-            return Err(format!("push constant のサイズ不一致: {} (期待 {})", push.len(), k.push_size));
+    fn ensure_pipeline(&mut self, kernel: usize) -> R<vk::Pipeline> {
+        if let Some(p) = self.kernels[kernel].pipeline {
+            return Ok(p);
         }
+        let (name, spv, _) = kernel_table()[kernel];
+        unsafe {
+            let words = ash::util::read_spv(&mut Cursor::new(spv)).map_err(vkerr("SPIR-V 読み込み"))?;
+            let module = self
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+                .map_err(vkerr(name))?;
+            let stage =
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let r = self.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)],
+                None,
+            );
+            self.device.destroy_shader_module(module, None);
+            let pipelines = r.map_err(|(_, e)| format!("パイプライン {name}: {e:?}"))?;
+            self.kernels[kernel].pipeline = Some(pipelines[0]);
+            Ok(pipelines[0])
+        }
+    }
+
+    fn dispatch(&mut self, kernel: u32, push: &[u8], gx: u32, gy: u32, gz: u32) -> R<()> {
+        let idx = kernel as usize;
+        let push_size = self.kernels.get(idx).ok_or("不明なカーネル")?.push_size;
+        if push.len() as u32 != push_size || push.len() as u32 > PUSH_MAX {
+            return Err(format!("push constant のサイズ不一致: {} (期待 {})", push.len(), push_size));
+        }
+        let pipeline = self.ensure_pipeline(idx)?;
         self.submit_sync(|d, c| unsafe {
-            d.cmd_bind_pipeline(c, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+            d.cmd_bind_pipeline(c, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(c, self.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             d.cmd_dispatch(c, gx, gy, gz);
         })
@@ -643,7 +668,7 @@ pub extern "C" fn vkrt_copy_d2d(dst: u64, src: u64, n: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vkrt_kernel_index(name: *const c_char) -> i32 {
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
-    KERNEL_TABLE.iter().position(|(n, _, _)| *n == name).map(|i| i as i32).unwrap_or(-1)
+    kernel_table().iter().position(|(n, _, _)| *n == name).map(|i| i as i32).unwrap_or(-1)
 }
 
 /// カーネルを dispatch する。push constant には各バッファのデバイスアドレスとパラメータを詰める。

@@ -22,11 +22,11 @@
 #include <mutex>
 #include <string>
 
-#include "vkrt.h"
+#include <unordered_map>
 
-namespace {
+#include "common.h"
 
-constexpr c10::DeviceType kDev = c10::DeviceType::PrivateUse1;
+namespace vkt {
 
 // ---- vkrt 呼び出しの補助 -------------------------------------------------------
 std::string last_error() {
@@ -49,10 +49,40 @@ std::mutex g_stats_mutex;
 std::map<std::string, int64_t> g_fallback_counts;
 std::map<std::string, int64_t> g_kernel_counts;
 
-void count_to(std::map<std::string, int64_t>& m, const std::string& name) {
+void count_fallback(const std::string& name) {
   std::lock_guard<std::mutex> lock(g_stats_mutex);
-  m[name]++;
+  g_fallback_counts[name]++;
 }
+
+void count_kernel(const std::string& name) {
+  std::lock_guard<std::mutex> lock(g_stats_mutex);
+  g_kernel_counts[name]++;
+}
+
+// ---- CPU フォールバック ------------------------------------------------------------------------
+void vulkan_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  count_fallback(op.schema().operator_name().name);
+  at::native::cpu_fallback(op, stack);
+}
+
+int kernel_index(const std::string& name) {
+  static std::mutex m;
+  static std::unordered_map<std::string, int> cache;
+  std::lock_guard<std::mutex> lock(m);
+  auto it = cache.find(name);
+  if (it != cache.end()) return it->second;
+  ensure_init();
+  int k = vkrt_kernel_index(name.c_str());
+  TORCH_CHECK(k >= 0, "vkrt: カーネル '", name, "' が見つかりません");
+  cache.emplace(name, k);
+  return k;
+}
+
+}  // namespace vkt
+
+using namespace vkt;
+
+namespace {
 
 // ---- アロケータ ----------------------------------------------------------------------
 // 現状は 1 テンソル = 1 回の vkAllocateMemory。割り当て数の上限（約 4096）対策のサブアロケータは後続。
@@ -118,8 +148,6 @@ struct HooksRegistrar {
 HooksRegistrar g_hooks_registrar;
 
 // ---- テンソルの転送 -----------------------------------------------------------------------
-bool is_vk(const at::Tensor& t) { return t.device().type() == kDev; }
-
 // data_ptr() から最終要素までの要素数（stride は非負を仮定）
 int64_t span_elems(const at::Tensor& t) {
   if (t.numel() == 0) return 0;
@@ -130,8 +158,6 @@ int64_t span_elems(const at::Tensor& t) {
   }
   return n;
 }
-
-uint64_t addr_of(const at::Tensor& t) { return reinterpret_cast<uint64_t>(t.data_ptr()); }
 
 // ホスト tensor src を、デバイス tensor dst へコピーする（dtype 変換・ブロードキャスト・非連続に対応）。
 void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
@@ -171,8 +197,10 @@ void copy_impl(const at::Tensor& dst, const at::Tensor& src) {
     if (src.numel() > 0 && addr_of(src) != addr_of(dst)) {
       vk_check(vkrt_copy_d2d(addr_of(dst), addr_of(src), dst.nbytes()), "d2d");
     }
+  } else if (ew_copy(dst, src.sizes() == dst.sizes() ? src : src.expand(dst.sizes()))) {
+    // GPU 上で dtype 変換・ストライド・ブロードキャスト付きコピー
   } else {
-    // 形状・dtype・連続性が違うデバイス間コピーは、いったんホストを経由する（専用カーネルは後続）。
+    // GPU カーネルが対応しない組み合わせ（整数型など）は、いったんホストを経由する。
     at::Tensor tmp = at::empty(src.sizes(), src.options().device(at::kCPU));
     copy_vk_to_cpu(tmp, src);
     copy_cpu_to_vk(dst, tmp);
@@ -255,41 +283,6 @@ const at::Tensor& wrapper_resize_(
   return self;
 }
 
-// ---- CPU フォールバック ------------------------------------------------------------------------------
-void vulkan_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
-  count_to(g_fallback_counts, op.schema().operator_name().name);
-  at::native::cpu_fallback(op, stack);
-}
-
-// ---- GPU カーネル ---------------------------------------------------------------------------------------
-int kernel_index(const char* name) {
-  int k = vkrt_kernel_index(name);
-  TORCH_CHECK(k >= 0, "vkrt: カーネル '", name, "' が見つかりません");
-  return k;
-}
-
-// add.Tensor: fp32・同形状・連続・alpha==1 のときだけ GPU。それ以外は CPU フォールバック（ブロードキャスト等は後続）。
-void add_tensor_boxed(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
-  auto args = torch::jit::last(*stack, 3);
-  const at::Tensor& a = args[0].toTensor();
-  const at::Tensor& b = args[1].toTensor();
-  at::Scalar alpha = args[2].toScalar();
-  bool fast = is_vk(a) && is_vk(b) && a.scalar_type() == at::kFloat && b.scalar_type() == at::kFloat && a.sizes() == b.sizes() &&
-              a.is_contiguous() && b.is_contiguous() && a.numel() > 0 && a.numel() < (int64_t(1) << 31) && alpha.toDouble() == 1.0;
-  if (!fast) {
-    vulkan_fallback(op, stack);
-    return;
-  }
-  at::Tensor out = at::empty(a.sizes(), a.options());
-  static const int k = kernel_index("add_f32");
-  uint64_t push[4] = {addr_of(a), addr_of(b), addr_of(out), (uint64_t)a.numel()};
-  uint32_t groups = (uint32_t)((a.numel() + 255) / 256);
-  vk_check(vkrt_dispatch((uint32_t)k, push, sizeof(push), groups, 1, 1), "dispatch add_f32");
-  count_to(g_kernel_counts, "aten::add.Tensor");
-  torch::jit::drop(*stack, 3);
-  torch::jit::push(*stack, out);
-}
-
 }  // namespace
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
@@ -306,7 +299,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_reshape_alias", &wrapper_reshape_alias);
   m.impl("unfold", &wrapper_unfold);
   m.impl("resize_", &wrapper_resize_);
-  m.impl("add.Tensor", torch::CppFunction::makeFromBoxedFunction<&add_tensor_boxed>());
 }
 
 // ---- autocast（torch.autocast(device_type="vk")） -------------------------------------------------------

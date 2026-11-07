@@ -27,7 +27,7 @@ os.add_dll_directory(REL)  # load() がビルド直後に import するので、
 # 2) C++ シム（vkrt.dll のインポートライブラリにリンク）
 module = load(
     name="torch_vulkan_C",
-    sources=[os.path.join(HERE, "csrc", "shim.cpp")],
+    sources=[os.path.join(HERE, "csrc", f) for f in ("shim.cpp", "ops_ew.cpp")],
     build_directory=BUILD_DIR,
     extra_cflags=["/O2", "/EHsc", "/permissive-", "/utf-8"],
     extra_include_paths=[os.path.join(HERE, "csrc")],

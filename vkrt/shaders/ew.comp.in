@@ -1,0 +1,191 @@
+// 要素演算テンプレート（tools/gen_shaders.py が -D 付きで展開する）。ストライド・ブロードキャスト対応、最大 5 次元。
+// 入力 a, b, c と出力 out の dtype は KIND 値（0=f32, 1=bf16, 2=f16, 3=u8/bool）で指定し、計算は常に fp32。
+// サブグループ演算は使わない（サブグループサイズは 32/64 で可変。IREE で決め打ちが誤結果を生んだ教訓）。
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer RF32 { float v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RBF16 { uint16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RF16 { float16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) buffer RU8 { uint8_t v[]; };
+
+layout(push_constant, scalar) uniform P {
+    uint64_t out_;
+    uint64_t a;
+    uint64_t b;
+    uint64_t c;
+    uint n;
+    uint pad;
+    uint sz[5];
+    uint so[5];
+    uint sa[5];
+    uint sb[5];
+    uint sc[5];
+    float s0;
+    float s1;
+} p;  // 合計 152 バイト
+
+layout(local_size_x = 256) in;
+
+float bf2f(uint16_t v) { return uintBitsToFloat(uint(v) << 16); }
+uint16_t f2bf(float x) {
+    if (isnan(x)) return uint16_t(0x7FC0u);
+    uint u = floatBitsToUint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);  // 最近接偶数丸め
+    return uint16_t(u >> 16);
+}
+
+#if A_KIND == 0
+float ldA(uint i) { return RF32(p.a).v[i]; }
+#elif A_KIND == 1
+float ldA(uint i) { return bf2f(RBF16(p.a).v[i]); }
+#elif A_KIND == 2
+float ldA(uint i) { return float(RF16(p.a).v[i]); }
+#elif A_KIND == 3
+float ldA(uint i) { return float(RU8(p.a).v[i]); }
+#endif
+
+#if B_KIND == 0
+float ldB(uint i) { return RF32(p.b).v[i]; }
+#elif B_KIND == 1
+float ldB(uint i) { return bf2f(RBF16(p.b).v[i]); }
+#elif B_KIND == 2
+float ldB(uint i) { return float(RF16(p.b).v[i]); }
+#elif B_KIND == 3
+float ldB(uint i) { return float(RU8(p.b).v[i]); }
+#endif
+
+#if C_KIND == 0
+float ldC(uint i) { return RF32(p.c).v[i]; }
+#elif C_KIND == 1
+float ldC(uint i) { return bf2f(RBF16(p.c).v[i]); }
+#elif C_KIND == 2
+float ldC(uint i) { return float(RF16(p.c).v[i]); }
+#elif C_KIND == 3
+float ldC(uint i) { return float(RU8(p.c).v[i]); }
+#endif
+
+#if O_KIND == 0
+void stO(uint i, float x) { RF32(p.out_).v[i] = x; }
+#elif O_KIND == 1
+void stO(uint i, float x) { RBF16(p.out_).v[i] = f2bf(x); }
+#elif O_KIND == 2
+void stO(uint i, float x) { RF16(p.out_).v[i] = float16_t(x); }
+#elif O_KIND == 3
+void stO(uint i, float x) { RU8(p.out_).v[i] = uint8_t(x != 0.0 ? 1u : 0u); }
+#endif
+
+const float PI = 3.14159265358979323846;
+
+// erf: Abramowitz-Stegun より高精度な有理近似（W. J. Cody 方式の fp32 向け簡易版: 相対誤差 ~1e-7）
+float erf_f(float x) {
+    float ax = abs(x);
+    // Numerical Recipes の erfc Chebyshev 近似（|相対誤差| < 1.2e-7）
+    float t = 1.0 / (1.0 + 0.5 * ax);
+    float poly = -ax * ax - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 +
+                 t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 +
+                 t * (-0.82215223 + t * 0.17087277))))))));
+    float erfc_v = t * exp(poly);
+    float r = 1.0 - erfc_v;
+    return x >= 0.0 ? r : -r;
+}
+
+float tanh_f(float v) {
+    float t = exp(-2.0 * abs(v));
+    float r = (1.0 - t) / (1.0 + t);
+    return v >= 0.0 ? r : -r;
+}
+
+// 引数を [-pi, pi] へ縮約してから sin/cos（GLSL の sin/cos は大きい引数で精度が保証されない）
+float reduce_pi(float x) {
+    float k = round(x * (1.0 / (2.0 * PI)));
+    // Cody-Waite: 2*pi を上位/下位に分けて引く
+    float r = x - k * 6.28125;
+    r = r - k * 0.0019353071795864769;
+    return r;
+}
+float sin_f(float x) { return sin(reduce_pi(x)); }
+float cos_f(float x) { return cos(reduce_pi(x)); }
+
+float pow_f(float x, float e) {
+    if (e == 2.0) return x * x;
+    if (e == 1.0) return x;
+    if (e == 0.0) return 1.0;
+    if (e == 0.5) return sqrt(x);
+    if (e == -1.0) return 1.0 / x;
+    float ei = round(e);
+    if (ei == e) {
+        float r = pow(abs(x), e);
+        bool odd = mod(abs(ei), 2.0) == 1.0;
+        return (x < 0.0 && odd) ? -r : r;
+    }
+    return pow(x, e);
+}
+
+float sigmoid_f(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+// silu_backward: g * sig * (1 + x * (1 - sig))
+float silu_bwd(float g, float x) {
+    float s = sigmoid_f(x);
+    return g * s * (1.0 + x * (1.0 - s));
+}
+
+// gelu_backward (approximate='none')
+float gelu_erf_bwd(float g, float x) {
+    const float kAlpha = 0.70710678118654752440;      // 1/sqrt(2)
+    const float kBeta = 0.39894228040143267794;       // 1/sqrt(2*pi)
+    float cdf = 0.5 * (1.0 + erf_f(x * kAlpha));
+    float pdf = kBeta * exp(-0.5 * x * x);
+    return g * (cdf + x * pdf);
+}
+
+// gelu_backward (approximate='tanh')
+float gelu_tanh_bwd(float g, float x) {
+    const float kBeta = 0.79788456080286535588;       // sqrt(2/pi)
+    const float kKappa = 0.044715;
+    float x_sq = x * x;
+    float x_cube = x_sq * x;
+    float inner = kBeta * (x + kKappa * x_cube);
+    float t = tanh_f(inner);
+    float left = 0.5 * x;
+    float right = 1.0 + t;
+    float left_derivative = 0.5 * right;
+    float right_derivative = left * (1.0 - t * t) * kBeta * (1.0 + 3.0 * kKappa * x_sq);
+    return g * (left_derivative + right_derivative);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    uint rem = i;
+    uint oo = 0u, oa = 0u, ob = 0u, oc = 0u;
+    for (int d = 4; d >= 0; --d) {
+        uint idx = rem % p.sz[d];
+        rem /= p.sz[d];
+        oo += idx * p.so[d];
+        oa += idx * p.sa[d];
+        ob += idx * p.sb[d];
+        oc += idx * p.sc[d];
+    }
+    float S0 = p.s0;
+    float S1 = p.s1;
+#ifdef HAS_A
+    float x = ldA(oa);
+#endif
+#ifdef HAS_B
+    float y = ldB(ob);
+#endif
+#ifdef HAS_C
+    float z = ldC(oc);
+#endif
+    float r = OP_EXPR;
+    stO(oo, r);
+}
