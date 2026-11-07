@@ -16,7 +16,10 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _load_extension():
-    # build.py が torch_vulkan/_C*.pyd を出力する。
+    # build.py が torch_vulkan/ に vkrt.dll と torch_vulkan_C*.pyd を出力する。
+    # Windows の Python は PATH を DLL 検索に使わないので、vkrt.dll のあるここを明示する。
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(_THIS_DIR)
     spec_dir = _THIS_DIR
     if spec_dir not in sys.path:
         sys.path.insert(0, spec_dir)
@@ -45,7 +48,23 @@ def set_device(device) -> None:
 
 
 def synchronize(device=None) -> None:
-    return None
+    _C.synchronize()
+
+
+def device_name() -> str:
+    return _C.device_name()
+
+
+def live_bytes() -> int:
+    return _C.live_bytes()
+
+
+def kernel_counts() -> dict:
+    return dict(_C.kernel_counts())
+
+
+def validation_errors() -> int:
+    return _C.validation_errors()
 
 
 def empty_cache() -> None:
@@ -98,7 +117,7 @@ def fallback_counts() -> dict:
 
 
 def reset_fallback_counts() -> None:
-    _C.reset_fallback_counts()
+    _C.reset_counts()
 
 
 def _register():
