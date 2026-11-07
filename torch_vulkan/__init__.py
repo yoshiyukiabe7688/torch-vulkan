@@ -200,3 +200,19 @@ def _register():
 
 
 _register()
+
+
+def set_coop_range(lo: int = 0, hi: int = 2**64 - 1, kind: int = 0) -> None:
+    """デバッグ用: 協調行列の対象になる mm の通し番号 [lo, hi) だけ協調行列を使う（それ以外はタイル型）。
+    kind: 0=すべて, 1=bmm のみ, 2=mm のみ。誤差の原因となる呼び出しの二分探索に使う。"""
+    _C.set_coop_range(int(lo), int(hi), int(kind))
+
+
+def reset_coop_calls() -> None:
+    """デバッグ用: 通し番号を 0 に戻す。"""
+    _C.reset_coop_calls()
+
+
+def coop_calls() -> int:
+    """デバッグ用: 協調行列の対象になった mm 呼び出しの通し番号（リセット後の累計）。"""
+    return _C.coop_calls()

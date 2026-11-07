@@ -33,6 +33,11 @@ std::atomic<bool>& coop_enabled() {
   return v;
 }
 
+// デバッグ用: 協調行列の対象になりうる呼び出しに通し番号を振り、[lo, hi) の範囲だけ協調行列を使う（それ以外はタイル型）。
+// 勾配誤差の原因となる呼び出しを二分探索で特定するための仕組み。kind: 0=すべて, 1=bmm(3 次元)のみ, 2=mm(2 次元)のみ。
+std::atomic<uint64_t> g_coop_calls{0}, g_coop_lo{0}, g_coop_hi{~uint64_t(0)};
+std::atomic<int> g_coop_kind{0};
+
 uint32_t coop_caps_cached() {
   static uint32_t caps = [] {
     ensure_init();
@@ -124,6 +129,12 @@ std::optional<at::Tensor> try_gemm(const at::Tensor& a, const at::Tensor& b, con
   if (coop_enabled().load() && M >= 32 && N >= 32 && K >= 32) {
     uint32_t caps = coop_caps_cached();
     use_coop = (a.scalar_type() == at::kBFloat16 && (caps & 2)) || (a.scalar_type() == at::kHalf && (caps & 1));
+    int kind_filter = g_coop_kind.load();
+    if (use_coop && ((kind_filter == 1 && !batched) || (kind_filter == 2 && batched))) use_coop = false;
+    if (use_coop) {
+      uint64_t idx = g_coop_calls.fetch_add(1);
+      use_coop = idx >= g_coop_lo.load() && idx < g_coop_hi.load();
+    }
   }
   if (use_coop) {
     // 128bit ベクトルロードが使える条件: 16 バイト整列、バッチ stride が 8 要素の倍数、連続軸でない stride も 8 の倍数、端数なし
@@ -192,6 +203,13 @@ at::Tensor k_baddbmm(const at::Tensor& self, const at::Tensor& a, const at::Tens
 namespace vkt {
 void set_coop_enabled(bool on) { coop_enabled().store(on); }
 uint32_t coop_caps() { return coop_caps_cached(); }
+void set_coop_range(uint64_t lo, uint64_t hi, int kind) {
+  g_coop_lo.store(lo);
+  g_coop_hi.store(hi);
+  g_coop_kind.store(kind);
+}
+void reset_coop_calls() { g_coop_calls.store(0); }
+uint64_t coop_calls() { return g_coop_calls.load(); }
 }  // namespace vkt
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

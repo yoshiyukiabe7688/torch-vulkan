@@ -455,6 +455,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("coop_caps", [] { return vkt::coop_caps(); });
   m.def("set_coop_enabled", [](bool on) { vkt::set_coop_enabled(on); });
+  m.def("set_coop_range", [](uint64_t lo, uint64_t hi, int kind) { vkt::set_coop_range(lo, hi, kind); });
+  m.def("reset_coop_calls", [] { vkt::reset_coop_calls(); });
+  m.def("coop_calls", [] { return vkt::coop_calls(); });
   m.def("reset_counts", [] {
     std::lock_guard<std::mutex> lock(g_stats_mutex);
     g_fallback_counts.clear();

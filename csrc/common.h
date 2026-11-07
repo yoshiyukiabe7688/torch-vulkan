@@ -33,6 +33,9 @@ bool ew_copy(const at::Tensor& dst, const at::Tensor& src);
 // 協調行列カーネルの有効/無効切替と対応状況(bit0=f16, bit1=bf16)（ops_mm.cpp）
 void set_coop_enabled(bool on);
 uint32_t coop_caps();
+void set_coop_range(uint64_t lo, uint64_t hi, int kind);
+void reset_coop_calls();
+uint64_t coop_calls();
 
 // カーネル名 -> 番号（キャッシュ付き）。無ければ例外。
 int kernel_index(const std::string& name);
