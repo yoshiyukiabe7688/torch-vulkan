@@ -412,6 +412,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("max_alloc", [] { ensure_init(); return vkrt_max_alloc(); });
   m.def("live_bytes", [] { ensure_init(); return vkrt_live_bytes(); });
+  m.def("memory_info", [] {
+    ensure_init();
+    uint64_t v[3] = {0, 0, 0};
+    vk_check(vkrt_memory_info(v), "memory_info");
+    return std::make_tuple(v[0], v[1], v[2]);
+  });
   m.def("peak_live_bytes", [] { ensure_init(); return vkrt_peak_live_bytes(); });
   m.def("reset_peak_live_bytes", [] { ensure_init(); vkrt_reset_peak_live_bytes(); });
   m.def("set_memory_limit", [](uint64_t bytes) { ensure_init(); vkrt_set_memory_limit(bytes); });

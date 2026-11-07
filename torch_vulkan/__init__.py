@@ -59,6 +59,13 @@ def live_bytes() -> int:
     return _C.live_bytes()
 
 
+def memory_info() -> dict:
+    """デバイスローカルメモリの状況（バイト）。budget=OS が許す使用上限（表示用や他プロセスを除く）、usage=OS から見た使用量
+    （他プロセス込み）、heap=ヒープ全体。VK_EXT_memory_budget が無い GPU では budget=ヒープの 85%。"""
+    budget, usage, heap = _C.memory_info()
+    return {"budget": budget, "usage": usage, "heap": heap}
+
+
 def peak_live_bytes() -> int:
     """確保中バイト数の最大値（reset_peak_live_bytes 以降）。学習中の VRAM ピークの目安。"""
     return _C.peak_live_bytes()

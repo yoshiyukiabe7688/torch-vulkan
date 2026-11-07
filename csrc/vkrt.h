@@ -9,6 +9,7 @@ size_t vkrt_last_error(char* buf, size_t cap);
 size_t vkrt_device_name(char* buf, size_t cap);
 uint64_t vkrt_max_alloc();
 uint64_t vkrt_live_bytes();
+int32_t vkrt_memory_info(uint64_t* out);
 uint64_t vkrt_peak_live_bytes();
 void vkrt_reset_peak_live_bytes();
 void vkrt_set_memory_limit(uint64_t bytes);
