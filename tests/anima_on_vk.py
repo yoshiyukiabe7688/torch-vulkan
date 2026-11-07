@@ -1,13 +1,15 @@
 """縮小 Anima（LoRA 付き）の fwd+bwd をダミー "vk" デバイスで実行し、CPU と照合する。
 フォールバックした ATen 演算の一覧が、Vulkan カーネルで実装すべき演算表（実測）になる。
-使い方: python anima_on_vk.py [fp32|bf16]
+使い方: SD_SCRIPTS_DIR=<sd-scripts のパス> python anima_on_vk.py [fp32|bf16]
 """
 
 import os
 import sys
 import time
 
-sys.path.insert(0, r"C:\Users\<user>\sd-scripts-no-cuda")
+# sd-scripts の場所（library / networks を import する）。環境変数 SD_SCRIPTS_DIR、未指定なら PYTHONPATH / カレントから探す
+if os.environ.get("SD_SCRIPTS_DIR"):
+    sys.path.insert(0, os.environ["SD_SCRIPTS_DIR"])
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
