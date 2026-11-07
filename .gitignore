@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.pyd
+*.pyc
+*.exp
+*.lib
+*.obj
+probe_out.txt
+anima_vk_*.txt
