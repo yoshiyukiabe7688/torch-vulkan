@@ -343,3 +343,26 @@ def test_adamw_matches_cpu(dt):
     assert max(abs(a - b) / max(abs(a), 1e-6) for a, b in zip(cpu, gpu)) < tol, (cpu, gpu)
     fb = torch_vulkan.fallback_counts()
     assert not {n for n in fb if n in ("aten::addcmul", "aten::addcdiv", "aten::lerp", "aten::mul", "aten::add", "aten::div", "aten::sqrt")}, fb
+
+
+# ---- 連続メモリ(次元結合後 1 次元)の高速経路 ew1_*（1 スレッド 4 要素、整数除算なし） ------------------------------------------
+@pytest.mark.parametrize("n", [1, 3, 4, 5, 1023, 1024, 1025, 4097, 100_003])
+@pytest.mark.parametrize("dt", DTYPES)
+def test_fast_path_matches_cpu_for_awkward_sizes(n, dt):
+    # 4 要素/スレッド・1024 要素/グループの境界（端数）で、結果が CPU と一致すること
+    a, b = rnd((n,), dt, seed=1), rnd((n,), dt, 0.5, 3.0, seed=2)
+    close(a.to(dev) * b.to(dev), a * b, dt)
+    close(a.to(dev) + 2.5, a + 2.5, dt)
+    close(torch.silu(a.to(dev)) if hasattr(torch, "silu") else F.silu(a.to(dev)), F.silu(a), dt, scale=2.0)
+    no_fallback("aten::mul", "aten::add", "aten::silu")
+
+
+def test_fast_path_handles_scalar_broadcast_and_noncontiguous_inputs_via_general_path():
+    x = rnd((64, 33))
+    xd = x.to(dev)
+    close(xd * xd[:1], x * x[:1])  # ブロードキャスト（2 次元に分かれる）
+    close(xd.t() * 2.0, x.t() * 2.0)  # 転置
+    close(xd[:, 3:30] + xd[:, 5:32], x[:, 3:30] + x[:, 5:32])  # 非連続な部分
+    s = torch.tensor(1.5).to(dev)
+    close(xd * s, x * 1.5)  # 0 次元（vk 上）
+    no_fallback("aten::mul", "aten::add")

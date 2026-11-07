@@ -136,8 +136,11 @@ void ew_run(const std::string& kernel, const char* aten_name, EwPush& P, const a
   P.c = c ? addr_of(*c) : 0;
   P.s0 = s0;
   P.s1 = s1;
-  uint32_t groups = (P.n + 255) / 256;
-  vk_check(vkrt_dispatch((uint32_t)kernel_index(kernel), &P, sizeof(P), groups, 1, 1), kernel.c_str());
+  // 次元結合後に 1 次元なら、除算を使わない高速経路（ew1_*、1 スレッド 4 要素）
+  bool fast = P.sz[0] == 1 && P.sz[1] == 1 && P.sz[2] == 1 && P.sz[3] == 1;
+  std::string kname = fast ? "ew1_" + kernel.substr(3) : kernel;
+  uint32_t groups = fast ? (P.n + 1023) / 1024 : (P.n + 255) / 256;
+  vk_check(vkrt_dispatch((uint32_t)kernel_index(kname), &P, sizeof(P), groups, 1, 1), kernel.c_str());
   count_kernel(aten_name);
 }
 

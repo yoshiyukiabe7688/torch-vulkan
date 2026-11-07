@@ -191,6 +191,46 @@ float gelu_tanh_bwd(float g, float x) {
     return g * (left_derivative + right_derivative);
 }
 
+#ifdef FAST1D
+// 次元結合後に 1 次元になった場合の高速経路（連続メモリの 2 項演算など、学習で最も多い形）。
+// 一般経路は 1 要素ごとに 5 次元分の整数除算・剰余をするため、除算の遅い GPU(Polaris など)で ALU 律速になり、
+// メモリ帯域のピークの 1 割程度しか使えなかった（RX 550 で実測 12GB/s / 112GB/s）。
+// ここでは除算を使わず、1 スレッドが 4 要素を（スレッド間でコアレスするよう間隔を空けて）処理して ILP を稼ぐ。
+void main() {
+    const uint total = gl_NumWorkGroups.x * 256u;
+    const uint base = gl_GlobalInvocationID.x;
+    const float S0 = p.s0;
+    const float S1 = p.s1;
+    float xs[4];
+    float ys[4];
+    float zs[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        uint i = base + k * total;
+        xs[k] = 0.0; ys[k] = 0.0; zs[k] = 0.0;
+        if (i < p.n) {
+#ifdef HAS_A
+            xs[k] = ldA(i * p.sa[4]);
+#endif
+#ifdef HAS_B
+            ys[k] = ldB(i * p.sb[4]);
+#endif
+#ifdef HAS_C
+            zs[k] = ldC(i * p.sc[4]);
+#endif
+        }
+    }
+    for (uint k = 0u; k < 4u; ++k) {
+        uint i = base + k * total;
+        if (i < p.n) {
+            float x = xs[k];
+            float y = ys[k];
+            float z = zs[k];
+            float r = OP_EXPR;
+            stO(i * p.so[4], r);
+        }
+    }
+}
+#else
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= p.n) return;
@@ -218,3 +258,4 @@ void main() {
     float r = OP_EXPR;
     stO(oo, r);
 }
+#endif
