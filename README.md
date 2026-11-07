@@ -17,3 +17,6 @@ venv\Scripts\python.exe tests\probe_m1.py      # 基本動作 + R1〜R3（17 項
 venv\Scripts\python.exe tests\anima_on_vk.py fp32|bf16   # 縮小 Anima(LoRA) の fwd+bwd を CPU と照合
 ```
 （venv は `C:\Users\<user>\sd-scripts-no-cuda\venv`。MSVC は `/utf-8` が必須：日本語コメントの末尾バイトが次行を巻き込む）
+
+## ライセンス
+MIT License（[LICENSE](LICENSE) を参照）。改変・再配布・商用利用は自由で、著作権表示とライセンス文の保持のみが条件です。
