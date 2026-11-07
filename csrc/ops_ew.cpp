@@ -398,6 +398,92 @@ at::Tensor& zero_(at::Tensor& self) {
   return VKT_FALLBACK(zero_, self);
 }
 
+// ---- 3 項演算 / lerp（オプティマイザ: addcmul_ / addcdiv_ / lerp_） ------------------------------------------------
+std::optional<at::Tensor> try_ternary(const char* op, const at::Tensor& a, const at::Tensor& b, const at::Tensor* c, double s0,
+                                      at::Tensor* inplace, const char* aten_name) {
+  if (!is_vk(a) || !is_vk(b) || (c && !is_vk(*c))) return std::nullopt;
+  const char* k = float_kind(a.scalar_type());
+  if (!k || a.scalar_type() != b.scalar_type() || (c && c->scalar_type() != a.scalar_type())) return std::nullopt;
+  IntVec sizes;
+  try {
+    auto sz = at::infer_size(a.sizes(), b.sizes());
+    sizes = c ? at::infer_size(sz, c->sizes()) : sz;
+  } catch (...) {
+    return std::nullopt;
+  }
+  EwPush P;
+  std::string name = std::string("ew_") + op + "_" + k + (c ? "" : std::string("_") + k + "_" + k);
+  if (inplace) {
+    if (IntVec(inplace->sizes().begin(), inplace->sizes().end()) != sizes) return std::nullopt;
+    IntVec so(inplace->strides().begin(), inplace->strides().end());
+    if (!ew_prepare(P, sizes, so, &a, &b, c)) return std::nullopt;
+    ew_run(name, aten_name, P, *inplace, &a, &b, c, (float)s0);
+    return *inplace;
+  }
+  if (!ew_prepare(P, sizes, contiguous_strides(sizes), &a, &b, c)) return std::nullopt;
+  at::Tensor out = at::empty(sizes, a.options());
+  ew_run(name, aten_name, P, out, &a, &b, c, (float)s0);
+  return out;
+}
+
+at::Tensor& k_addcmul_(at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value) {
+  if (try_ternary("addcmul", self, t1, &t2, value.toDouble(), &self, "aten::addcmul_")) return self;
+  return VKT_FALLBACK(addcmul_, self, t1, t2, value);
+}
+at::Tensor& k_addcdiv_(at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value) {
+  if (try_ternary("addcdiv", self, t1, &t2, value.toDouble(), &self, "aten::addcdiv_")) return self;
+  return VKT_FALLBACK(addcdiv_, self, t1, t2, value);
+}
+at::Tensor k_addcmul(const at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value) {
+  if (auto r = try_ternary("addcmul", self, t1, &t2, value.toDouble(), nullptr, "aten::addcmul")) return *r;
+  return VKT_FALLBACK(addcmul, self, t1, t2, value);
+}
+at::Tensor k_addcdiv(const at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value) {
+  if (auto r = try_ternary("addcdiv", self, t1, &t2, value.toDouble(), nullptr, "aten::addcdiv")) return *r;
+  return VKT_FALLBACK(addcdiv, self, t1, t2, value);
+}
+at::Tensor& k_lerp__Scalar(at::Tensor& self, const at::Tensor& end, const at::Scalar& weight) {
+  if (try_ternary("lerp", self, end, nullptr, weight.toDouble(), &self, "aten::lerp_.Scalar")) return self;
+  return VKT_FALLBACK(lerp__Scalar, self, end, weight);
+}
+at::Tensor k_lerp_Scalar(const at::Tensor& self, const at::Tensor& end, const at::Scalar& weight) {
+  if (auto r = try_ternary("lerp", self, end, nullptr, weight.toDouble(), nullptr, "aten::lerp.Scalar")) return *r;
+  return VKT_FALLBACK(lerp_Scalar, self, end, weight);
+}
+
+// ---- Scalar オーバーロード（Python の float / int を直接受ける内部呼び出し: mul_(1 - lr*wd) など） ------------------
+at::Tensor wrap_scalar(const at::Scalar& s) { return at::scalar_to_tensor(s); }  // ラップされたスカラー扱い（型昇格に影響しない）
+
+#define VKT_BINARY_SCALAR(NAME, OP, ATEN)                                                                      \
+  at::Tensor NAME##_Scalar(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha) {                  \
+    if (auto r = try_binary(OP, a, wrap_scalar(b), alpha.toDouble(), nullptr, ATEN ".Scalar")) return *r;        \
+    return VKT_FALLBACK(NAME##_Scalar, a, b, alpha);                                                            \
+  }                                                                                                              \
+  at::Tensor& NAME##__Scalar(at::Tensor& self, const at::Scalar& b, const at::Scalar& alpha) {                   \
+    if (try_binary(OP, self, wrap_scalar(b), alpha.toDouble(), &self, ATEN "_.Scalar")) return self;             \
+    return VKT_FALLBACK(NAME##__Scalar, self, b, alpha);                                                        \
+  }
+
+VKT_BINARY_SCALAR(add, Bin::Add, "aten::add")
+VKT_BINARY_SCALAR(sub, Bin::Sub, "aten::sub")
+
+at::Tensor mul_Scalar(const at::Tensor& a, const at::Scalar& b) {
+  if (auto r = try_binary(Bin::Mul, a, wrap_scalar(b), 1.0, nullptr, "aten::mul.Scalar")) return *r;
+  return VKT_FALLBACK(mul_Scalar, a, b);
+}
+at::Tensor& mul__Scalar(at::Tensor& self, const at::Scalar& b) {
+  if (try_binary(Bin::Mul, self, wrap_scalar(b), 1.0, &self, "aten::mul_.Scalar")) return self;
+  return VKT_FALLBACK(mul__Scalar, self, b);
+}
+at::Tensor div_Scalar(const at::Tensor& a, const at::Scalar& b) {
+  if (auto r = try_binary(Bin::Div, a, wrap_scalar(b), 1.0, nullptr, "aten::div.Scalar")) return *r;
+  return VKT_FALLBACK(div_Scalar, a, b);
+}
+at::Tensor& div__Scalar(at::Tensor& self, const at::Scalar& b) {
+  if (try_binary(Bin::Div, self, wrap_scalar(b), 1.0, &self, "aten::div_.Scalar")) return self;
+  return VKT_FALLBACK(div__Scalar, self, b);
+}
+
 }  // namespace
 
 namespace vkt {
@@ -445,4 +531,18 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("where.self", &where_self);
   m.impl("fill_.Scalar", &fill__Scalar);
   m.impl("zero_", &zero_);
+  m.impl("addcmul_", &k_addcmul_);
+  m.impl("addcdiv_", &k_addcdiv_);
+  m.impl("addcmul", &k_addcmul);
+  m.impl("addcdiv", &k_addcdiv);
+  m.impl("lerp_.Scalar", &k_lerp__Scalar);
+  m.impl("lerp.Scalar", &k_lerp_Scalar);
+  m.impl("add.Scalar", &add_Scalar);
+  m.impl("add_.Scalar", &add__Scalar);
+  m.impl("sub.Scalar", &sub_Scalar);
+  m.impl("sub_.Scalar", &sub__Scalar);
+  m.impl("mul.Scalar", &mul_Scalar);
+  m.impl("mul_.Scalar", &mul__Scalar);
+  m.impl("div.Scalar", &div_Scalar);
+  m.impl("div_.Scalar", &div__Scalar);
 }

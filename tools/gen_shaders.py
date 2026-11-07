@@ -68,10 +68,15 @@ UNARY = {
     "gelu_erf": "0.5 * x * (1.0 + erf_f(x * 0.70710678118654752440))",
     "gelu_tanh": "0.5 * x * (1.0 + tanh_f(0.79788456080286535588 * (x + 0.044715 * x * x * x)))",
 }
+TERNARY = {  # x = self, y = tensor1, z = tensor2（同 dtype）。オプティマイザ用
+    "addcmul": "x + S0 * y * z",
+    "addcdiv": "x + S0 * y / z",
+}
 BACKWARD = {  # x = grad, y = self（同 dtype）
     "silu_bwd": "silu_bwd(x, y)",
     "gelu_erf_bwd": "gelu_erf_bwd(x, y)",
     "gelu_tanh_bwd": "gelu_tanh_bwd(x, y)",
+    "lerp": "x + S0 * (y - x)",  # lerp(self, end, weight): x=self, y=end（同 dtype）
 }
 
 
@@ -91,6 +96,9 @@ def variants():
     for op, expr in BACKWARD.items():
         for a in FLOATS:
             out.append((f"ew_{op}_{a}_{a}_{a}", expr, a, a, None, a))
+    for op, expr in TERNARY.items():
+        for a in FLOATS:
+            out.append((f"ew_{op}_{a}", expr, a, a, a, a))
     for a in FLOATS:  # where(cond, self, other)
         out.append((f"ew_where_{a}_{a}_{a}", "z != 0.0 ? x : y", a, a, "u8", a))
     for o in FLOATS:  # fill（入力なし。S0 を書き込む）

@@ -285,3 +285,61 @@ def test_cpu_fallback_result_is_moved_back_to_device_when_first_arg_is_cpu_scala
     out = torch.atan2(torch.tensor(2.0), x.to(dev))
     assert out.device.type == "vk"
     assert torch.allclose(out.cpu(), torch.atan2(torch.tensor(2.0), x), atol=1e-6)
+
+
+# ---- オプティマイザ用: addcmul_ / addcdiv_ / lerp_ と Scalar オーバーロード ------------------------------------------------------
+@pytest.mark.parametrize("dt", DTYPES)
+def test_addcmul_addcdiv_lerp(dt):
+    a, b, c = rnd((6, 9), dt, seed=1), rnd((6, 9), dt, seed=2), rnd((6, 9), dt, 0.5, 3.0, seed=3)
+    ad = a.to(dev)
+    close(torch.addcmul(ad, b.to(dev), c.to(dev), value=0.3), torch.addcmul(a, b, c, value=0.3), dt, scale=2.0)
+    close(torch.addcdiv(ad, b.to(dev), c.to(dev), value=-0.7), torch.addcdiv(a, b, c, value=-0.7), dt, scale=2.0)
+    close(torch.lerp(ad, b.to(dev), 0.1), torch.lerp(a, b, 0.1), dt, scale=2.0)
+    x, xd = a.clone(), a.to(dev)
+    xd.addcmul_(b.to(dev), c.to(dev), value=0.3); x.addcmul_(b, c, value=0.3)
+    xd.addcdiv_(b.to(dev), c.to(dev), value=2.0); x.addcdiv_(b, c, value=2.0)
+    xd.lerp_(b.to(dev), 0.25); x.lerp_(b, 0.25)
+    close(xd, x, dt, scale=4.0)
+    no_fallback("aten::addcmul", "aten::addcdiv", "aten::lerp")
+
+
+@pytest.mark.parametrize("dt", DTYPES)
+def test_scalar_overloads_do_not_promote_dtype(dt):
+    x = rnd((5, 5), dt, lo=0.5, hi=3.0)
+    xd = x.to(dev)
+    for name, fn in {"mul_": lambda t: t.mul_(0.999), "add_": lambda t: t.add_(0.5, alpha=2), "sub_": lambda t: t.sub_(1.5),
+                     "div_": lambda t: t.div_(3.0)}.items():
+        a, b = x.clone(), xd.clone()
+        fn(a); fn(b)
+        assert b.dtype == dt, name
+        close(b, a, dt, scale=2.0)
+    for fn in (lambda t: torch.mul(t, 2.5), lambda t: torch.add(t, 1.5, alpha=2), lambda t: torch.sub(t, 0.5), lambda t: torch.div(t, 4.0)):
+        out = fn(xd)
+        assert out.dtype == dt
+        close(out, fn(x), dt, scale=2.0)
+    no_fallback("aten::mul", "aten::add", "aten::sub", "aten::div")
+
+
+@pytest.mark.parametrize("dt", [torch.float32, torch.bfloat16])
+def test_adamw_matches_cpu(dt):
+    def run(device):
+        torch.manual_seed(0)
+        m = torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.GELU(), torch.nn.Linear(32, 4)).to(dt).to(device)
+        x, y = torch.randn(32, 16).to(dt).to(device), torch.randn(32, 4).to(dt).to(device)
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+        ls = []
+        for _ in range(10):
+            opt.zero_grad()
+            loss = F.mse_loss(m(x).float(), y.float())
+            loss.backward()
+            opt.step()
+            ls.append(loss.item())
+        return ls
+
+    cpu = run("cpu")
+    torch_vulkan.reset_fallback_counts()
+    gpu = run(dev)
+    tol = 1e-4 if dt == torch.float32 else 5e-2
+    assert max(abs(a - b) / max(abs(a), 1e-6) for a, b in zip(cpu, gpu)) < tol, (cpu, gpu)
+    fb = torch_vulkan.fallback_counts()
+    assert not {n for n in fb if n in ("aten::addcmul", "aten::addcdiv", "aten::lerp", "aten::mul", "aten::add", "aten::div", "aten::sqrt")}, fb
