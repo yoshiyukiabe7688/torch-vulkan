@@ -34,8 +34,14 @@ const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const ALIGN: u64 = 512;
 const SLAB_BYTES: u64 = 512 << 20;
-/// 1 バッチに積む最大コマンド数（超えたら submit する。待たない）
-const MAX_BATCH: u32 = 4096;
+/// 1 バッチに積む最大コマンド数（超えたら submit する。待たない）。
+/// 1 回の submit が長時間走ると、ドライバのハング検出（Linux amdgpu: 約 10 秒、Windows TDR: 約 2 秒）で
+/// デバイスが失われる。遅い GPU（RX 550 など）で 4096 個を積むと超えるので、小さめにする。VKRT_MAX_BATCH で上書きできる。
+const DEFAULT_MAX_BATCH: u32 = 64;
+fn max_batch() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("VKRT_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_BATCH))
+}
 /// これ以上の要求は専用バッファにする（解放時にドライバへ返す）。
 const DEDICATED_MIN: u64 = 256 << 20;
 
@@ -69,6 +75,8 @@ struct Staging {
     memory: vk::DeviceMemory,
     ptr: *mut u8,
     size: u64,
+    /// HOST_COHERENT でなければ、読み出しの前に invalidate が要る
+    coherent: bool,
 }
 
 struct Runtime {
@@ -95,6 +103,8 @@ struct Runtime {
     slabs: BTreeMap<u64, Slab>,
     blocks: BTreeMap<u64, Block>,
     staging: Staging,
+    /// GPU -> ホストの読み出し専用（HOST_CACHED 優先）。書き込み結合メモリを CPU から読むと約 0.2GB/s まで落ちる（RX 550 で実測）
+    readback: Staging,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     mem_device_local: u32,
     max_alloc: u64,
@@ -376,6 +386,29 @@ impl Runtime {
             device.bind_buffer_memory(sbuf, smem, 0).map_err(vkerr("ステージング bind"))?;
             let sptr = device.map_memory(smem, 0, STAGING_BYTES, vk::MemoryMapFlags::empty()).map_err(vkerr("map"))? as *mut u8;
 
+            // 読み出し専用ステージング。CPU から読むので HOST_CACHED を優先する（無ければアップロード用と同じ種類）。
+            let rbuf = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(STAGING_BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST),
+                    None,
+                )
+                .map_err(vkerr("読み出しバッファ"))?;
+            let rreq = device.get_buffer_memory_requirements(rbuf);
+            let hv = vk::MemoryPropertyFlags::HOST_VISIBLE;
+            let (rtype, rcoherent) = [
+                hv | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
+                hv | vk::MemoryPropertyFlags::HOST_CACHED,
+                hv | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ]
+            .iter()
+            .find_map(|&f| find_memory_type(&mem_props, rreq.memory_type_bits, f).map(|t| (t, f.contains(vk::MemoryPropertyFlags::HOST_COHERENT))))
+            .ok_or("読み出し用のホスト可視メモリがありません")?;
+            let rmem = device
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(rreq.size).memory_type_index(rtype), None)
+                .map_err(vkerr("読み出しメモリ"))?;
+            device.bind_buffer_memory(rbuf, rmem, 0).map_err(vkerr("読み出し bind"))?;
+            let rptr = device.map_memory(rmem, 0, STAGING_BYTES, vk::MemoryMapFlags::empty()).map_err(vkerr("map"))? as *mut u8;
+
             // パイプライン（descriptor 無し・push constant のみ。バッファは push constant 内のアドレスで渡す）
             let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(PUSH_MAX)];
             let layout = device
@@ -411,7 +444,8 @@ impl Runtime {
                 kernels,
                 slabs: BTreeMap::new(),
                 blocks: BTreeMap::new(),
-                staging: Staging { buffer: sbuf, memory: smem, ptr: sptr, size: STAGING_BYTES },
+                staging: Staging { buffer: sbuf, memory: smem, ptr: sptr, size: STAGING_BYTES, coherent: true },
+                readback: Staging { buffer: rbuf, memory: rmem, ptr: rptr, size: STAGING_BYTES, coherent: rcoherent },
                 mem_props,
                 mem_device_local,
                 max_alloc,
@@ -499,7 +533,7 @@ impl Runtime {
         f(&self.device, cmd);
         self.barrier(cmd);
         self.pending += 1;
-        if self.pending >= MAX_BATCH {
+        if self.pending >= max_batch() {
             self.flush(false)?;
         }
         Ok(())
@@ -697,12 +731,18 @@ impl Runtime {
         let (buf, off) = self.resolve(src, n)?;
         let mut done = 0u64;
         while done < n {
-            let chunk = (n - done).min(self.staging.size);
-            let (sb, o) = (self.staging.buffer, off + done);
+            let chunk = (n - done).min(self.readback.size);
+            let (sb, o) = (self.readback.buffer, off + done);
             self.submit_sync(|d, c| unsafe {
                 d.cmd_copy_buffer(c, buf, sb, &[vk::BufferCopy::default().src_offset(o).dst_offset(0).size(chunk)]);
             })?;
-            unsafe { std::ptr::copy_nonoverlapping(self.staging.ptr, dst.add(done as usize), chunk as usize) };
+            unsafe {
+                if !self.readback.coherent {
+                    let range = vk::MappedMemoryRange::default().memory(self.readback.memory).offset(0).size(vk::WHOLE_SIZE);
+                    self.device.invalidate_mapped_memory_ranges(&[range]).map_err(vkerr("invalidate"))?;
+                }
+                std::ptr::copy_nonoverlapping(self.readback.ptr, dst.add(done as usize), chunk as usize);
+            }
             done += chunk;
         }
         Ok(())
