@@ -35,6 +35,8 @@ SHAPES = [
     (1, 2, 64, 64, 128),    # D = 128（Anima）
     (1, 2, 17, 5, 20),      # D が 32 未満・Sk < 32
     (1, 2, 130, 130, 96),   # 複数ブロック・D が 32 の倍数
+    (1, 2, 35, 37, 30),     # D が 4 の倍数でない（ベクトル読み込みを使わない経路）
+    (1, 1, 48, 48, 36),     # D=36
 ]
 
 
@@ -148,3 +150,20 @@ def test_auto_policy():
     torch_vulkan.reset_fallback_counts()
     F.scaled_dot_product_attention(q.to(dev, torch.bfloat16), q.to(dev, torch.bfloat16), q.to(dev, torch.bfloat16))
     assert torch_vulkan.kernel_counts().get(OVR, 0) == 0
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_unaligned_views(dtype):
+    """q / k / v がストレージ内で中途半端な位置から始まる（ポインタがベクトル読み込みに揃わない）ときも正しい。"""
+    B, H, S, D = 1, 2, 45, 64
+    n = B * H * S * D
+    flats = [rnd((n + 3,), dtype, 10 + i) for i in range(3)]
+    gflat = rnd((n + 3,), dtype, 20)
+    views = [f[3:].reshape(B, H, S, D) for f in flats]
+    gv = gflat[3:].reshape(B, H, S, D)
+    ro, rq, rk, rv = reference(*views, gv)
+    q, k, v = [f.to(dev)[3:].view(B, H, S, D).detach().requires_grad_(True) for f in flats]
+    o = F.scaled_dot_product_attention(q, k, v)
+    o.backward(gv.to(dev))
+    for name, got, ref in (("out", o, ro), ("dq", q.grad, rq), ("dk", k.grad, rk), ("dv", v.grad, rv)):
+        assert rel_err(got.cpu(), ref) < REL[dtype], f"{name} {dtype}: {rel_err(got.cpu(), ref)}"
