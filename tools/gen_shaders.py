@@ -31,6 +31,9 @@ ROW_KERNELS = [
     ("im2col.comp.in", "col2im", 1, 72),
     ("upsample.comp.in", "up_fwd", 0, 40),
     ("upsample.comp.in", "up_bwd", 1, 40),
+    ("gn.comp.in", "gn_fwd", 0, 88),
+    ("gn.comp.in", "gn_bwd", 1, 88),
+    ("gn.comp.in", "gn_wgrad", 2, 88),
 ]
 
 KIND = {"f32": 0, "bf16": 1, "f16": 2, "u8": 3}

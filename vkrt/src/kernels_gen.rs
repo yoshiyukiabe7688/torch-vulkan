@@ -303,4 +303,13 @@ pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[
     ("up_bwd_f32", include_bytes!("../shaders/gen/up_bwd_f32.spv"), 40),
     ("up_bwd_bf16", include_bytes!("../shaders/gen/up_bwd_bf16.spv"), 40),
     ("up_bwd_f16", include_bytes!("../shaders/gen/up_bwd_f16.spv"), 40),
+    ("gn_fwd_f32", include_bytes!("../shaders/gen/gn_fwd_f32.spv"), 88),
+    ("gn_fwd_bf16", include_bytes!("../shaders/gen/gn_fwd_bf16.spv"), 88),
+    ("gn_fwd_f16", include_bytes!("../shaders/gen/gn_fwd_f16.spv"), 88),
+    ("gn_bwd_f32", include_bytes!("../shaders/gen/gn_bwd_f32.spv"), 88),
+    ("gn_bwd_bf16", include_bytes!("../shaders/gen/gn_bwd_bf16.spv"), 88),
+    ("gn_bwd_f16", include_bytes!("../shaders/gen/gn_bwd_f16.spv"), 88),
+    ("gn_wgrad_f32", include_bytes!("../shaders/gen/gn_wgrad_f32.spv"), 88),
+    ("gn_wgrad_bf16", include_bytes!("../shaders/gen/gn_wgrad_bf16.spv"), 88),
+    ("gn_wgrad_f16", include_bytes!("../shaders/gen/gn_wgrad_f16.spv"), 88),
 ];
