@@ -1,0 +1,43 @@
+// nearest 補間（整数倍のみ）の forward / backward。NCHW 連続、KIND: 入出力 dtype、計算は fp32。
+// MODE 0: y[nc, oh, ow] = x[nc, oh / FH, ow / FW]（FH = OH / H, FW = OW / W）。スレッド 1 つが y の 1 要素。total = NC*OH*OW。
+// MODE 1: gx[nc, h, w] = Σ_{dy<FH, dx<FW} gy[nc, h*FH + dy, w*FW + dx]。スレッド 1 つが gx の 1 要素。total = NC*H*W。
+// ディスパッチは 2 次元（gx <= 65535）: idx = (gy * gridDim.x + gx) * 256 + local。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t src;   // MODE0: x / MODE1: gy
+    uint64_t dst;   // MODE0: y / MODE1: gx
+    uint NC, H, W;
+    uint OH, OW;
+    uint total;
+} p;  // 合計 40 バイト
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (idx >= p.total) return;
+    uint FH = p.OH / p.H;
+    uint FW = p.OW / p.W;
+#if MODE == 0
+    uint ow = idx % p.OW;
+    uint t = idx / p.OW;
+    uint oh = t % p.OH;
+    uint nc = t / p.OH;
+    stK(p.dst, idx, ldK(p.src, (nc * p.H + oh / FH) * p.W + ow / FW));
+#else
+    uint w = idx % p.W;
+    uint t = idx / p.W;
+    uint h = t % p.H;
+    uint nc = t / p.H;
+    float s = 0.0;
+    for (uint dy = 0u; dy < FH; ++dy) {
+        for (uint dx = 0u; dx < FW; ++dx) {
+            s += ldK(p.src, (nc * p.OH + h * FH + dy) * p.OW + w * FW + dx);
+        }
+    }
+    stK(p.dst, idx, s);
+#endif
+}

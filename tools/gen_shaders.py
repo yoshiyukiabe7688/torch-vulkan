@@ -27,6 +27,10 @@ ROW_KERNELS = [
     ("ln.comp.in", "ln_bwd", 1, 72),
     ("ln.comp.in", "ln_wgrad", 2, 72),
     ("reduce.comp.in", "reduce", None, 80),
+    ("im2col.comp.in", "im2col", 0, 72),
+    ("im2col.comp.in", "col2im", 1, 72),
+    ("upsample.comp.in", "up_fwd", 0, 40),
+    ("upsample.comp.in", "up_bwd", 1, 40),
 ]
 
 KIND = {"f32": 0, "bf16": 1, "f16": 2, "u8": 3}

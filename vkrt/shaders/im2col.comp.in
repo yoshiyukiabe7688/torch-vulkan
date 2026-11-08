@@ -1,0 +1,70 @@
+// conv2d 用の im2col / col2im（NCHW 連続、dilation=1、groups=1）。KIND: 入出力の dtype。計算は fp32。
+// MODE 0 (im2col): cols[n, c*KH*KW + kh*KW + kw, oh*OW + ow] = x[n, c, oh*SH - PH + kh, ow*SW - PW + kw]（範囲外は 0）
+//   スレッド 1 つが cols の 1 要素を書く。total = N * C*KH*KW * OH*OW。
+// MODE 1 (col2im): gx[n, c, ih, iw] = Σ_{kh,kw} cols[n, c*KH*KW + kh*KW + kw, oh*OW + ow]
+//   （ih = oh*SH - PH + kh, iw = ow*SW - PW + kw を満たす (kh, kw, oh, ow) について）。
+//   scatter（atomics）ではなく gather 式。スレッド 1 つが gx の 1 要素を書く。total = N * C * H * W。
+// ディスパッチは 2 次元（gx <= 65535）: idx = (gy * gridDim.x + gx) * 256 + local。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t x;      // MODE0: 入力 x / MODE1: 出力 gx
+    uint64_t cols;   // MODE0: 出力 cols / MODE1: 入力 cols
+    uint N, C, H, W;
+    uint OH, OW, KH, KW;
+    uint SH, SW, PH, PW;
+    uint total;
+    uint pad;
+} p;  // 合計 72 バイト
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (idx >= p.total) return;
+    uint KHW = p.KH * p.KW;
+    uint L = p.OH * p.OW;
+#if MODE == 0
+    uint l = idx % L;
+    uint t = idx / L;
+    uint ckk = t % (p.C * KHW);
+    uint n = t / (p.C * KHW);
+    uint c = ckk / KHW;
+    uint kk = ckk % KHW;
+    uint kh = kk / p.KW;
+    uint kw = kk % p.KW;
+    uint oh = l / p.OW;
+    uint ow = l % p.OW;
+    int ih = int(oh * p.SH) - int(p.PH) + int(kh);
+    int iw = int(ow * p.SW) - int(p.PW) + int(kw);
+    float v = 0.0;
+    if (ih >= 0 && ih < int(p.H) && iw >= 0 && iw < int(p.W)) {
+        v = ldK(p.x, ((n * p.C + c) * p.H + uint(ih)) * p.W + uint(iw));
+    }
+    stK(p.cols, idx, v);
+#else
+    uint iw = idx % p.W;
+    uint t = idx / p.W;
+    uint ih = t % p.H;
+    t /= p.H;
+    uint c = t % p.C;
+    uint n = t / p.C;
+    float s = 0.0;
+    for (uint kh = 0u; kh < p.KH; ++kh) {
+        int th = int(ih) + int(p.PH) - int(kh);
+        if (th < 0 || (uint(th) % p.SH) != 0u) continue;
+        uint oh = uint(th) / p.SH;
+        if (oh >= p.OH) continue;
+        for (uint kw = 0u; kw < p.KW; ++kw) {
+            int tw = int(iw) + int(p.PW) - int(kw);
+            if (tw < 0 || (uint(tw) % p.SW) != 0u) continue;
+            uint ow = uint(tw) / p.SW;
+            if (ow >= p.OW) continue;
+            s += ldK(p.cols, (n * p.C * KHW + c * KHW + kh * p.KW + kw) * L + oh * p.OW + ow);
+        }
+    }
+    stK(p.x, idx, s);
+#endif
+}

@@ -37,7 +37,7 @@ else:
     ldflags = [f"-L{REL}", "-lvkrt", f"-Wl,-rpath,{REL}", "'-Wl,-rpath,$$ORIGIN'"]
 module = load(
     name="torch_vulkan_C",
-    sources=[os.path.join(HERE, "csrc", f) for f in ("shim.cpp", "ops_ew.cpp", "ops_mm.cpp", "ops_rows.cpp")],
+    sources=[os.path.join(HERE, "csrc", f) for f in ("shim.cpp", "ops_ew.cpp", "ops_mm.cpp", "ops_rows.cpp", "ops_conv.cpp")],
     build_directory=BUILD_DIR,
     extra_cflags=cflags,
     extra_include_paths=[os.path.join(HERE, "csrc")],
