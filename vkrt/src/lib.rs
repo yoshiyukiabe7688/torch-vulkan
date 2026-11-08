@@ -231,12 +231,42 @@ impl Runtime {
             }
 
             let pds = instance.enumerate_physical_devices().map_err(vkerr("物理デバイス列挙"))?;
-            let pd = pds
+            let names: Vec<String> = pds
                 .iter()
-                .copied()
-                .find(|&p| instance.get_physical_device_properties(p).device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
-                .or(pds.first().copied())
-                .ok_or("Vulkan デバイスが見つかりません")?;
+                .map(|&p| {
+                    let pr = instance.get_physical_device_properties(p);
+                    pr.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                })
+                .collect();
+            let pd = match std::env::var("VKRT_DEVICE") {
+                // 明示選択: 番号、または名前の部分一致（大文字小文字を無視。複数一致したら番号の小さい方）
+                Ok(sel) if !sel.trim().is_empty() => {
+                    let sel = sel.trim();
+                    let idx = match sel.parse::<usize>() {
+                        Ok(i) => (i < pds.len()).then_some(i),
+                        Err(_) => {
+                            let key = sel.to_lowercase();
+                            names.iter().position(|n| n.to_lowercase().contains(&key))
+                        }
+                    };
+                    match idx {
+                        Some(i) => pds[i],
+                        None => {
+                            let list: Vec<String> = names.iter().enumerate().map(|(i, n)| format!("{i}: {n}")).collect();
+                            return Err(format!(
+                                "VKRT_DEVICE={sel} に一致する Vulkan デバイスがありません（利用可能: {}）",
+                                list.join(", ")
+                            ));
+                        }
+                    }
+                }
+                _ => pds
+                    .iter()
+                    .copied()
+                    .find(|&p| instance.get_physical_device_properties(p).device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
+                    .or(pds.first().copied())
+                    .ok_or("Vulkan デバイスが見つかりません")?,
+            };
             let props = instance.get_physical_device_properties(pd);
             let device_name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
