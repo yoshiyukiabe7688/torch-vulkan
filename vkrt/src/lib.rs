@@ -29,7 +29,7 @@ fn kernel_table() -> &'static [(&'static str, &'static [u8], u32)] {
 }
 
 const STAGING_BYTES: u64 = 16 << 20;
-const PUSH_MAX: u32 = 256; // maxPushConstantsSize（AMD gfx1201 実測 256。起動時に実機の値と照合する）
+const PUSH_MAX: u32 = 128; // maxPushConstantsSize の Vulkan 保証最小値。Windows の AMD ドライバ（RX 640 実測）は 128 を報告する。起動時に実機の値と照合する
 const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const ALIGN: u64 = 512;

@@ -17,7 +17,7 @@ GEN = os.path.join(SHADERS, "gen")
 SDK = os.environ.get("VULKAN_SDK", r"C:\VulkanSDK\1.4.363.0")
 GLSLC = os.path.join(SDK, "Bin", "glslc.exe")
 SPIRV_VAL = os.path.join(SDK, "Bin", "spirv-val.exe")
-PUSH_SIZE = 152  # ew.comp.in の push constant ブロックのバイト数（C++ 側の構造体と一致させる）
+PUSH_SIZE = 128  # ew.comp.in の push constant ブロックのバイト数（C++ 側の構造体と一致させる）
 MM_PUSH_SIZE = 112  # mm.comp.in
 # 行単位カーネル: (テンプレート, 名前の接頭辞, MODE or None, push constant バイト数)
 ROW_KERNELS = [
