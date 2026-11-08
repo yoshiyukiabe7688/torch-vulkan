@@ -1,0 +1,303 @@
+// 融合アテンションの協調行列版（VK_KHR_cooperative_matrix。bf16 / f16 入力、fp32 累積）。attn.comp.in の高速版。
+// アルゴリズムは attn.comp.in と同じ（flash attention 型。logits は fp32 のまま、N x N の行列を作らない）。
+// 前提: サブグループサイズ 32 固定、workgroup=128（4 サブグループ。各サブグループが 16 行を担当）。vkrt が mm_coop と同じ条件で有効判定する。
+// 入力 Q/K/V/dO は C++ が [B*H, S_pad, D_pad] の連続バッファへ 0 埋めで詰め直したもの（S_pad は Sq→64、Sk→32 の倍数、D_pad は 16 の倍数）。
+//   → coopMatLoad を境界チェック無しで使える。
+// 出力は [B, S, H, D] の連続メモリへ、共有メモリ経由で範囲内の要素だけ書く。
+// MODE 0: forward（out、lse）／ MODE 1: dK・dV（1 サブグループが 16 キー行、全クエリを回る）／ MODE 2: dQ（16 クエリ行、全キーを回る）。
+// delta（sum_d out * dO）は attn.comp.in の MODE 3 を使う。
+// 行ごとの統計（m, l）は 1 行を 2 レーンで持つ（レーン = 行 * 2 + 半分、半分ごとに 16 列）。
+// KIND: 1=bf16, 2=f16
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#if KIND == 1
+#extension GL_EXT_bfloat16 : require
+#define ETYPE bfloat16_t
+#else
+#define ETYPE float16_t
+#endif
+
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RE { ETYPE v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RU16 { uint16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer RF { float v[]; };
+
+layout(push_constant, scalar) uniform P {
+    uint64_t q;      // padded Q
+    uint64_t k;      // padded K
+    uint64_t v;      // padded V
+    uint64_t d;      // MODE 1,2: padded dO
+    uint64_t lse;    // [B*H, Sq] f32
+    uint64_t delta;  // [B*H, Sq] f32
+    uint64_t o0;     // MODE0: out / MODE1: dk / MODE2: dq   （[B,S,H,D] 連続）
+    uint64_t o1;     // MODE1: dv
+    uint B, H, Sq, Sk, D;
+    uint Sqp, Skp, Dp;
+    float scale;
+} p;  // 合計 104 バイト
+
+layout(local_size_x = 128) in;
+
+const float NEG = -3.0e38;
+
+ETYPE from_f(float x) {
+#if KIND == 1
+    if (isnan(x)) return uintBitsToBFloat16EXT(uint16_t(0x7FC0u));
+    uint u = floatBitsToUint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return uintBitsToBFloat16EXT(uint16_t(u >> 16));
+#else
+    return float16_t(x);
+#endif
+}
+
+void store_elem(uint64_t base, uint i, float x) {
+#if KIND == 1
+    if (isnan(x)) { RU16(base).v[i] = uint16_t(0x7FC0u); return; }
+    uint u = floatBitsToUint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    RU16(base).v[i] = uint16_t(u >> 16);
+#else
+    RU16(base).v[i] = float16BitsToUint16(float16_t(x));
+#endif
+}
+
+#define SS 36   // S タイルの行 stride（fp32、16 行 x 32 列 + 余白）
+#define PS 40   // P タイルの行 stride（ETYPE、16 行 x 32 列 + 余白）
+#define FS 20   // 出力フラグメントの行 stride（fp32、16 x 16 + 余白）
+
+shared float Ss[4 * 16 * SS];     // S（MODE 1 は S^T）。末尾の出力ステージングにも使う
+shared ETYPE Pb[4 * 16 * PS];     // P（または P^T）
+#if MODE >= 1
+shared float Ds[4 * 16 * SS];     // dP（または dP^T）
+shared ETYPE Db[4 * 16 * PS];     // dS（または dS^T）
+#endif
+#if MODE == 0
+shared float Al[4 * 256];         // alpha を行ごとに 16 列へ複製した行列の元
+#endif
+
+#define MA coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_A coopmat<ETYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B coopmat<ETYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+// acc[16 行 x 32 列] = X[16 行（xrow0 から）x Dp] * Y[32 行（yrow0 から）x Dp]^T   （X: 行優先で A、Y: 列優先で B として読む）
+// 結果は共有メモリ dst（このサブグループの領域、stride SS）へ書く。
+void dot_tile_to_shared(uint64_t xb, uint xrow0, uint64_t yb, uint yrow0, bool dst_is_d, uint sg) {
+    MA a0 = MA(0.0);
+    MA a1 = MA(0.0);
+    for (uint d0 = 0u; d0 < p.Dp; d0 += 16u) {
+        MAT_A xa;
+        coopMatLoad(xa, RE(xb).v, xrow0 * p.Dp + d0, p.Dp, gl_CooperativeMatrixLayoutRowMajor);
+        MAT_B y0;
+        MAT_B y1;
+        coopMatLoad(y0, RE(yb).v, yrow0 * p.Dp + d0, p.Dp, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(y1, RE(yb).v, (yrow0 + 16u) * p.Dp + d0, p.Dp, gl_CooperativeMatrixLayoutColumnMajor);
+        a0 = coopMatMulAdd(xa, y0, a0);
+        a1 = coopMatMulAdd(xa, y1, a1);
+    }
+#if MODE >= 1
+    if (dst_is_d) {
+        coopMatStore(a0, Ds, sg * 16u * SS, SS, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(a1, Ds, sg * 16u * SS + 16u, SS, gl_CooperativeMatrixLayoutRowMajor);
+        return;
+    }
+#endif
+    coopMatStore(a0, Ss, sg * 16u * SS, SS, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(a1, Ss, sg * 16u * SS + 16u, SS, gl_CooperativeMatrixLayoutRowMajor);
+}
+
+// 累積フラグメント O[0..7]（16 行 x 16 列ずつ）を、範囲内の要素だけ [B,S,H,D] へ書く。row_mul[行] を掛ける。
+// ステージングは Ss のこのサブグループの領域（stride FS）。呼び出し前に、row_mul は shared RowMul に入れておく。
+shared float RowMul[4 * 16];
+
+void write_out(uint64_t base, MA O[8], uint b, uint h, uint S, uint row0, uint sg, float mulc, bool f32) {
+    uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        if (i * 16u >= p.Dp) break;
+        barrier();
+        coopMatStore(O[i], Ss, sg * 16u * SS, FS, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint e = 0u; e < 8u; ++e) {
+            uint idx = lane * 8u + e;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            uint row = row0 + r;
+            uint col = i * 16u + c;
+            if (row < S && col < p.D) {
+                uint oi = ((b * S + row) * p.H + gl_WorkGroupID.y % p.H) * p.D + col;
+                float ov = Ss[sg * 16u * SS + r * FS + c] * RowMul[sg * 16u + r] * mulc;
+                if (f32) RF(base).v[oi] = ov; else store_elem(base, oi, ov);
+            }
+        }
+    }
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint bh = gl_WorkGroupID.y;
+    const uint b = bh / p.H;
+    const uint h = bh % p.H;
+    const uint row = lane >> 1u;       // 行（0..15）
+    const uint half_ = lane & 1u;      // 列の半分（0: 0..15, 1: 16..31）
+    const uint sb = sg * 16u * SS;
+    const uint pb = sg * 16u * PS;
+    MA O[8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) O[i] = MA(0.0);
+
+#if MODE == 0
+    const uint qrow0 = gl_WorkGroupID.x * 64u + sg * 16u;
+    const uint qpbase = bh * p.Sqp;
+    const uint kpbase = bh * p.Skp;
+    float m = NEG;
+    float l = 0.0;
+    for (uint kb0 = 0u; kb0 < p.Sk; kb0 += 32u) {
+        dot_tile_to_shared(p.q, qpbase + qrow0, p.k, kpbase + kb0, false, sg);
+        barrier();
+        // ---- オンライン softmax（1 行を 2 レーンで）----
+        float s[16];
+        float mrow = NEG;
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            uint col = kb0 + half_ * 16u + j;
+            float v = (col < p.Sk) ? Ss[sb + row * SS + half_ * 16u + j] * p.scale : NEG;
+            s[j] = v;
+            mrow = max(mrow, v);
+        }
+        mrow = max(mrow, subgroupShuffleXor(mrow, 1u));
+        float mn = max(m, mrow);
+        float alpha = exp(m - mn);
+        float lsum = 0.0;
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            float pv = (s[j] <= -1.0e38) ? 0.0 : exp(s[j] - mn);
+            lsum += pv;
+            Pb[pb + row * PS + half_ * 16u + j] = from_f(pv);
+        }
+        lsum += subgroupShuffleXor(lsum, 1u);
+        l = l * alpha + lsum;
+        m = mn;
+        [[unroll]] for (uint c = 0u; c < 8u; ++c) Al[sg * 256u + row * 16u + half_ * 8u + c] = alpha;
+        barrier();
+        MA am;
+        coopMatLoad(am, Al, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) O[i] = O[i] * am;
+        for (uint kk = 0u; kk < 2u; ++kk) {
+            MAT_A pa;
+            coopMatLoad(pa, Pb, pb + kk * 16u, PS, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                if (i * 16u >= p.Dp) break;
+                MAT_B vb;
+                coopMatLoad(vb, RE(p.v).v, (kpbase + kb0 + kk * 16u) * p.Dp + i * 16u, p.Dp, gl_CooperativeMatrixLayoutRowMajor);
+                O[i] = coopMatMulAdd(pa, vb, O[i]);
+            }
+        }
+        barrier();
+    }
+    float il = l > 0.0 ? 1.0 / l : 0.0;
+    if (half_ == 0u) RowMul[sg * 16u + row] = il;
+    uint qg = qrow0 + row;
+    if (half_ == 0u && qg < p.Sq) RF(p.lse).v[bh * p.Sq + qg] = l > 0.0 ? m + log(l) : NEG;
+    barrier();
+    write_out(p.o0, O, b, h, p.Sq, qrow0, sg, 1.0, false);
+    if (p.o1 != 0ul) write_out(p.o1, O, b, h, p.Sq, qrow0, sg, 1.0, true);  // fp32 の O（delta 用）
+
+#elif MODE == 1
+    // サブグループが 16 キー行を担当。S^T[16 キー x 32 クエリ] = K_blk Q^T、dP^T = V_blk dO^T。
+    const uint krow0 = gl_WorkGroupID.x * 64u + sg * 16u;
+    const uint kpbase = bh * p.Skp;
+    const uint qpbase = bh * p.Sqp;
+    MA dv[8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) dv[i] = MA(0.0);
+    const uint key = krow0 + row;
+    for (uint q0 = 0u; q0 < p.Sq; q0 += 32u) {
+        dot_tile_to_shared(p.k, kpbase + krow0, p.q, qpbase + q0, false, sg);
+        dot_tile_to_shared(p.v, kpbase + krow0, p.d, qpbase + q0, true, sg);
+        barrier();
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            uint qq = q0 + half_ * 16u + j;
+            float pv = 0.0;
+            float dsv = 0.0;
+            if (qq < p.Sq && key < p.Sk) {
+                float lq = RF(p.lse).v[bh * p.Sq + qq];
+                float dq_ = RF(p.delta).v[bh * p.Sq + qq];
+                pv = exp(Ss[sb + row * SS + half_ * 16u + j] * p.scale - lq);
+                dsv = pv * (Ds[sb + row * SS + half_ * 16u + j] - dq_);
+            }
+            Pb[pb + row * PS + half_ * 16u + j] = from_f(pv);
+            Db[pb + row * PS + half_ * 16u + j] = from_f(dsv);
+        }
+        barrier();
+        for (uint kk = 0u; kk < 2u; ++kk) {
+            MAT_A pa;
+            MAT_A da;
+            coopMatLoad(pa, Pb, pb + kk * 16u, PS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(da, Db, pb + kk * 16u, PS, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                if (i * 16u >= p.Dp) break;
+                MAT_B dob;
+                MAT_B qb_;
+                coopMatLoad(dob, RE(p.d).v, (qpbase + q0 + kk * 16u) * p.Dp + i * 16u, p.Dp, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(qb_, RE(p.q).v, (qpbase + q0 + kk * 16u) * p.Dp + i * 16u, p.Dp, gl_CooperativeMatrixLayoutRowMajor);
+                dv[i] = coopMatMulAdd(pa, dob, dv[i]);
+                O[i] = coopMatMulAdd(da, qb_, O[i]);
+            }
+        }
+        barrier();
+    }
+    if (half_ == 0u) RowMul[sg * 16u + row] = 1.0;
+    barrier();
+    write_out(p.o0, O, b, h, p.Sk, krow0, sg, p.scale, false);   // dK = scale * dS^T Q
+    write_out(p.o1, dv, b, h, p.Sk, krow0, sg, 1.0, false);      // dV
+
+#else
+    // サブグループが 16 クエリ行を担当。S = Q K^T、dP = dO V^T、dQ += dS K。
+    const uint qrow0 = gl_WorkGroupID.x * 64u + sg * 16u;
+    const uint qpbase = bh * p.Sqp;
+    const uint kpbase = bh * p.Skp;
+    const uint qg = qrow0 + row;
+    float lq = 0.0;
+    float dq_ = 0.0;
+    if (qg < p.Sq) {
+        lq = RF(p.lse).v[bh * p.Sq + qg];
+        dq_ = RF(p.delta).v[bh * p.Sq + qg];
+    }
+    for (uint kb0 = 0u; kb0 < p.Sk; kb0 += 32u) {
+        dot_tile_to_shared(p.q, qpbase + qrow0, p.k, kpbase + kb0, false, sg);
+        dot_tile_to_shared(p.d, qpbase + qrow0, p.v, kpbase + kb0, true, sg);
+        barrier();
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            uint col = kb0 + half_ * 16u + j;
+            float dsv = 0.0;
+            if (qg < p.Sq && col < p.Sk) {
+                float pv = exp(Ss[sb + row * SS + half_ * 16u + j] * p.scale - lq);
+                dsv = pv * (Ds[sb + row * SS + half_ * 16u + j] - dq_);
+            }
+            Db[pb + row * PS + half_ * 16u + j] = from_f(dsv);
+        }
+        barrier();
+        for (uint kk = 0u; kk < 2u; ++kk) {
+            MAT_A da;
+            coopMatLoad(da, Db, pb + kk * 16u, PS, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                if (i * 16u >= p.Dp) break;
+                MAT_B kb_;
+                coopMatLoad(kb_, RE(p.k).v, (kpbase + kb0 + kk * 16u) * p.Dp + i * 16u, p.Dp, gl_CooperativeMatrixLayoutRowMajor);
+                O[i] = coopMatMulAdd(da, kb_, O[i]);
+            }
+        }
+        barrier();
+    }
+    if (half_ == 0u) RowMul[sg * 16u + row] = 1.0;
+    barrier();
+    write_out(p.o0, O, b, h, p.Sq, qrow0, sg, p.scale, false);
+#endif
+}

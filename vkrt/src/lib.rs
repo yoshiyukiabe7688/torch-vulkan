@@ -893,7 +893,7 @@ impl Runtime {
                 .device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .map_err(vkerr(name))?;
-            let is_coop = name.starts_with("mm_coop");
+            let is_coop = name.starts_with("mm_coop") || name.starts_with("attn_coop");
             if is_coop {
                 let need = if name.ends_with("_bf16") { 2 } else { 1 };
                 if self.coop_caps & need == 0 {

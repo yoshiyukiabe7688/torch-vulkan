@@ -1,0 +1,279 @@
+// 融合アテンション（flash attention 型。logits を fp32 のまま保持し、N x N の行列をメモリに作らない）。
+// KIND: q/k/v/dO/出力の dtype（計算は常に fp32）。D <= 128。マスク・dropout・causal 無し。
+// MODE 0: forward。out[b,q,h,:] = softmax(scale * Q K^T) V、lse[b,h,q] = logsumexp（fp32）。
+// MODE 1: backward の dK / dV（1 ワークグループが 1 つのキーブロック 32 行を担当し、全クエリブロックを回る）。
+// MODE 2: backward の dQ（1 ワークグループが 1 つのクエリブロック 32 行を担当し、全キーブロックを回る）。
+// MODE 3: delta[b,h,q] = sum_d out * dO（fp32）。
+// 入力 q / k / v / dO は (batch, head, seq) のストライドを指定でき、d 方向は連続。k と v はストライドを共有する。
+// 出力（out / dq / dk / dv）は [B, S, H, D] の連続メモリ（PyTorch 標準の SDPA と同じく、[B,H,S,D] に permute して返す）。
+// タイル: 32 x 32、D を 32 ごとのチャンクで共有メモリへ。256 スレッド。共有メモリは約 20〜25KB（上限 32KB 以内）。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t a0;  // q（MODE 3: out）
+    uint64_t a1;  // k
+    uint64_t a2;  // v
+    uint64_t a3;  // MODE0: out / MODE1,2,3: dO
+    uint64_t a4;  // lse
+    uint64_t a5;  // delta
+    uint64_t a6;  // MODE1: dk / MODE2: dq
+    uint64_t a7;  // MODE1: dv
+    uint qsb, qsh, qss;
+    uint ksb, ksh, kss;  // k と v 共通
+    uint dsb, dsh, dss;  // dO（MODE 3 でも dO）
+    uint B, H, Sq, Sk, D;
+    float scale;
+    uint pad;
+} p;  // 合計 128 バイト
+
+layout(local_size_x = 256) in;
+
+const float NEG = -3.0e38;
+
+#if MODE != 3
+shared float R[4096];  // チャンクバッファ(TA / TB)と、32 行 x 128 列のブロック(V / dO / Q / K)で兼用
+#define TA_BASE 0u
+#define TB_BASE 1056u
+#if MODE <= 1
+shared float Ps[1056];
+#endif
+#if MODE >= 1
+shared float DSs[1056];
+#endif
+
+void ld_tile(bool toB, uint64_t base, uint off, uint ss, uint row0, uint nrows, uint d0) {
+    uint t = gl_LocalInvocationID.x;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint e = t + i * 256u;
+        uint row = e >> 5u;
+        uint col = e & 31u;
+        uint sr = row0 + row;
+        uint d = d0 + col;
+        float v = (sr < nrows && d < p.D) ? ldK(base, off + sr * ss + d) : 0.0;
+        R[(toB ? TB_BASE : TA_BASE) + row * 33u + col] = v;
+    }
+}
+
+// acc.x = A[r0] . B[c0], acc.y = A[r0] . B[c0+1], acc.z = A[r0+1] . B[c0], acc.w = A[r0+1] . B[c0+1]
+// r0 = (t / 16) * 2、c0 = (t % 16) * 2。A の行は ar0 から、B の行は br0 から（各 32 行、範囲外は 0）。
+vec4 tile_dot(uint64_t ab, uint ao, uint as_, uint ar0, uint anr, uint64_t bb, uint bo, uint bs, uint br0, uint bnr) {
+    uint t = gl_LocalInvocationID.x;
+    uint r0 = (t >> 4u) * 2u;
+    uint c0 = (t & 15u) * 2u;
+    vec4 acc = vec4(0.0);
+    for (uint d0 = 0u; d0 < p.D; d0 += 32u) {
+        barrier();
+        ld_tile(false, ab, ao, as_, ar0, anr, d0);
+        ld_tile(true, bb, bo, bs, br0, bnr, d0);
+        barrier();
+        for (uint d = 0u; d < 32u; ++d) {
+            float a0 = R[TA_BASE + r0 * 33u + d];
+            float a1 = R[TA_BASE + (r0 + 1u) * 33u + d];
+            float b0 = R[TB_BASE + c0 * 33u + d];
+            float b1 = R[TB_BASE + (c0 + 1u) * 33u + d];
+            acc.x += a0 * b0;
+            acc.y += a0 * b1;
+            acc.z += a1 * b0;
+            acc.w += a1 * b1;
+        }
+    }
+    barrier();  // 呼び出し側が R を再利用してよい
+    return acc;
+}
+
+// 32 行 x 128 列のブロックを R へ（行 e/128、列 e%128。D を超える列と範囲外の行は 0）。
+void ld_block(uint64_t base, uint off, uint ss, uint row0, uint nrows) {
+    uint t = gl_LocalInvocationID.x;
+    for (uint i = 0u; i < 16u; ++i) {
+        uint e = t + i * 256u;
+        uint row = e >> 7u;
+        uint col = e & 127u;
+        uint sr = row0 + row;
+        R[e] = (sr < nrows && col < p.D) ? ldK(base, off + sr * ss + col) : 0.0;
+    }
+}
+
+// ブロック R の (行 row, 列グループ i) の 4 要素。列は l8 * 4 + 32 * i + {0..3}。
+vec4 r4(uint row, uint l8, uint i) {
+    uint o = row * 128u + l8 * 4u + 32u * i;
+    return vec4(R[o], R[o + 1u], R[o + 2u], R[o + 3u]);
+}
+
+// 書き込み先（[B, S, H, D] 連続）へ、スレッドの 4x4 要素のうち D 内のものを書く。
+void store_rows(uint64_t base, uint b, uint h, uint S, uint row, uint l8, vec4 acc[4], float mul) {
+    if (row >= S) return;
+    uint o = ((b * S + row) * p.H + h) * p.D;
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint k = 0u; k < 4u; ++k) {
+            uint d = l8 * 4u + 32u * i + k;
+            if (d < p.D) stK(base, o + d, acc[i][k] * mul);
+        }
+    }
+}
+
+// fp32 の出力（delta 用）。base は fp32 の [B, S, H, D] 連続メモリ。
+void store_rows32(uint64_t base, uint b, uint h, uint S, uint row, uint l8, vec4 acc[4], float mul) {
+    if (row >= S) return;
+    uint o = ((b * S + row) * p.H + h) * p.D;
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint k = 0u; k < 4u; ++k) {
+            uint d = l8 * 4u + 32u * i + k;
+            if (d < p.D) stF(base, o + d, acc[i][k] * mul);
+        }
+    }
+}
+#endif
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint bh = gl_WorkGroupID.y;
+    uint b = bh / p.H;
+    uint h = bh % p.H;
+#if MODE == 3
+    uint idx = gl_WorkGroupID.x * 256u + t;
+    if (idx >= p.B * p.H * p.Sq) return;
+    uint q = idx % p.Sq;
+    uint bhh = idx / p.Sq;
+    uint bb = bhh / p.H;
+    uint hh = bhh % p.H;
+    uint oo = ((bb * p.Sq + q) * p.H + hh) * p.D;
+    uint dd = bb * p.dsb + hh * p.dsh + q * p.dss;
+    float s = 0.0;
+    // pad != 0 のとき out は fp32（丸め前の O。delta を逆伝播の P と整合させるため）
+    for (uint d = 0u; d < p.D; ++d) s += ((p.pad != 0u) ? ldF(p.a0, oo + d) : ldK(p.a0, oo + d)) * ldK(p.a3, dd + d);
+    stF(p.a5, idx, s);
+#else
+    uint qoff = b * p.qsb + h * p.qsh;
+    uint koff = b * p.ksb + h * p.ksh;
+    uint doff = b * p.dsb + h * p.dsh;
+    uint r0 = (t >> 4u) * 2u;       // S タイルでのこのスレッドの 2 行
+    uint c0 = (t & 15u) * 2u;       // S タイルでのこのスレッドの 2 列
+    uint rr = t >> 3u;               // 出力 / 累積タイルでのこのスレッドの行（8 スレッドで 1 行）
+    uint l8 = t & 7u;
+    vec4 acc[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+
+#if MODE == 0
+    uint qb0 = gl_WorkGroupID.x * 32u;
+    float m = NEG;
+    float l = 0.0;
+    for (uint kb0 = 0u; kb0 < p.Sk; kb0 += 32u) {
+        vec4 s = tile_dot(p.a0, qoff, p.qss, qb0, p.Sq, p.a1, koff, p.kss, kb0, p.Sk);
+        Ps[r0 * 33u + c0] = (kb0 + c0 < p.Sk) ? s.x * p.scale : NEG;
+        Ps[r0 * 33u + c0 + 1u] = (kb0 + c0 + 1u < p.Sk) ? s.y * p.scale : NEG;
+        Ps[(r0 + 1u) * 33u + c0] = (kb0 + c0 < p.Sk) ? s.z * p.scale : NEG;
+        Ps[(r0 + 1u) * 33u + c0 + 1u] = (kb0 + c0 + 1u < p.Sk) ? s.w * p.scale : NEG;
+        ld_block(p.a2, koff, p.kss, kb0, p.Sk);
+        barrier();
+        float mrow = NEG;
+        for (uint j = 0u; j < 32u; ++j) mrow = max(mrow, Ps[rr * 33u + j]);
+        float mn = max(m, mrow);
+        float alpha = exp(m - mn);
+        barrier();
+        for (uint k = 0u; k < 4u; ++k) {
+            uint j = l8 * 4u + k;
+            float sv = Ps[rr * 33u + j];
+            Ps[rr * 33u + j] = (sv <= -1.0e38) ? 0.0 : exp(sv - mn);
+        }
+        barrier();
+        float ls = 0.0;
+        for (uint j = 0u; j < 32u; ++j) ls += Ps[rr * 33u + j];
+        l = l * alpha + ls;
+        m = mn;
+        for (uint i = 0u; i < 4u; ++i) acc[i] *= alpha;
+        for (uint j = 0u; j < 32u; ++j) {
+            float pj = Ps[rr * 33u + j];
+            for (uint i = 0u; i < 4u; ++i) acc[i] += pj * r4(j, l8, i);
+        }
+        barrier();
+    }
+    uint q = qb0 + rr;
+    store_rows(p.a3, b, h, p.Sq, q, l8, acc, l > 0.0 ? 1.0 / l : 0.0);
+    if (p.a5 != 0ul) store_rows32(p.a5, b, h, p.Sq, q, l8, acc, l > 0.0 ? 1.0 / l : 0.0);  // fp32 の O（delta 用）
+    if (l8 == 0u && q < p.Sq) stF(p.a4, bh * p.Sq + q, l > 0.0 ? m + log(l) : NEG);
+
+#elif MODE == 1
+    uint kb0 = gl_WorkGroupID.x * 32u;
+    vec4 dv[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+    for (uint qb0 = 0u; qb0 < p.Sq; qb0 += 32u) {
+        vec4 s = tile_dot(p.a0, qoff, p.qss, qb0, p.Sq, p.a1, koff, p.kss, kb0, p.Sk);
+        vec4 dp = tile_dot(p.a3, doff, p.dss, qb0, p.Sq, p.a2, koff, p.kss, kb0, p.Sk);
+        uint qa0 = qb0 + r0;
+        uint qa1 = qa0 + 1u;
+        bool qv0 = qa0 < p.Sq;
+        bool qv1 = qa1 < p.Sq;
+        float lse0 = qv0 ? ldF(p.a4, bh * p.Sq + qa0) : 0.0;
+        float lse1 = qv1 ? ldF(p.a4, bh * p.Sq + qa1) : 0.0;
+        float de0 = qv0 ? ldF(p.a5, bh * p.Sq + qa0) : 0.0;
+        float de1 = qv1 ? ldF(p.a5, bh * p.Sq + qa1) : 0.0;
+        bool kv0 = kb0 + c0 < p.Sk;
+        bool kv1 = kb0 + c0 + 1u < p.Sk;
+        float p00 = (qv0 && kv0) ? exp(s.x * p.scale - lse0) : 0.0;
+        float p01 = (qv0 && kv1) ? exp(s.y * p.scale - lse0) : 0.0;
+        float p10 = (qv1 && kv0) ? exp(s.z * p.scale - lse1) : 0.0;
+        float p11 = (qv1 && kv1) ? exp(s.w * p.scale - lse1) : 0.0;
+        Ps[r0 * 33u + c0] = p00;
+        Ps[r0 * 33u + c0 + 1u] = p01;
+        Ps[(r0 + 1u) * 33u + c0] = p10;
+        Ps[(r0 + 1u) * 33u + c0 + 1u] = p11;
+        DSs[r0 * 33u + c0] = p00 * (dp.x - de0);
+        DSs[r0 * 33u + c0 + 1u] = p01 * (dp.y - de0);
+        DSs[(r0 + 1u) * 33u + c0] = p10 * (dp.z - de1);
+        DSs[(r0 + 1u) * 33u + c0 + 1u] = p11 * (dp.w - de1);
+        barrier();
+        ld_block(p.a3, doff, p.dss, qb0, p.Sq);
+        barrier();
+        for (uint q = 0u; q < 32u; ++q) {
+            float pq = Ps[q * 33u + rr];
+            for (uint i = 0u; i < 4u; ++i) dv[i] += pq * r4(q, l8, i);
+        }
+        barrier();
+        ld_block(p.a0, qoff, p.qss, qb0, p.Sq);
+        barrier();
+        for (uint q = 0u; q < 32u; ++q) {
+            float dsq = DSs[q * 33u + rr];
+            for (uint i = 0u; i < 4u; ++i) acc[i] += dsq * r4(q, l8, i);
+        }
+        barrier();
+    }
+    uint key = kb0 + rr;
+    store_rows(p.a6, b, h, p.Sk, key, l8, acc, p.scale);
+    store_rows(p.a7, b, h, p.Sk, key, l8, dv, 1.0);
+
+#elif MODE == 2
+    uint qb0 = gl_WorkGroupID.x * 32u;
+    for (uint kb0 = 0u; kb0 < p.Sk; kb0 += 32u) {
+        vec4 s = tile_dot(p.a0, qoff, p.qss, qb0, p.Sq, p.a1, koff, p.kss, kb0, p.Sk);
+        vec4 dp = tile_dot(p.a3, doff, p.dss, qb0, p.Sq, p.a2, koff, p.kss, kb0, p.Sk);
+        uint qa0 = qb0 + r0;
+        uint qa1 = qa0 + 1u;
+        bool qv0 = qa0 < p.Sq;
+        bool qv1 = qa1 < p.Sq;
+        float lse0 = qv0 ? ldF(p.a4, bh * p.Sq + qa0) : 0.0;
+        float lse1 = qv1 ? ldF(p.a4, bh * p.Sq + qa1) : 0.0;
+        float de0 = qv0 ? ldF(p.a5, bh * p.Sq + qa0) : 0.0;
+        float de1 = qv1 ? ldF(p.a5, bh * p.Sq + qa1) : 0.0;
+        bool kv0 = kb0 + c0 < p.Sk;
+        bool kv1 = kb0 + c0 + 1u < p.Sk;
+        float p00 = (qv0 && kv0) ? exp(s.x * p.scale - lse0) : 0.0;
+        float p01 = (qv0 && kv1) ? exp(s.y * p.scale - lse0) : 0.0;
+        float p10 = (qv1 && kv0) ? exp(s.z * p.scale - lse1) : 0.0;
+        float p11 = (qv1 && kv1) ? exp(s.w * p.scale - lse1) : 0.0;
+        DSs[r0 * 33u + c0] = p00 * (dp.x - de0);
+        DSs[r0 * 33u + c0 + 1u] = p01 * (dp.y - de0);
+        DSs[(r0 + 1u) * 33u + c0] = p10 * (dp.z - de1);
+        DSs[(r0 + 1u) * 33u + c0 + 1u] = p11 * (dp.w - de1);
+        barrier();
+        ld_block(p.a1, koff, p.kss, kb0, p.Sk);
+        barrier();
+        for (uint k = 0u; k < 32u; ++k) {
+            float dsk = DSs[rr * 33u + k];
+            for (uint i = 0u; i < 4u; ++i) acc[i] += dsk * r4(k, l8, i);
+        }
+        barrier();
+    }
+    store_rows(p.a6, b, h, p.Sq, qb0 + rr, l8, acc, p.scale);
+#endif
+#endif
+}

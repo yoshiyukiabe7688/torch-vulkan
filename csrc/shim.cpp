@@ -408,6 +408,7 @@ TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
   KERNEL_PRIVATEUSEONE(conv1d, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(conv2d, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(conv3d, lower_precision_fp)
+  KERNEL_PRIVATEUSEONE(scaled_dot_product_attention, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(layer_norm, fp32)
   KERNEL_PRIVATEUSEONE(softmax, int, fp32)
   KERNEL_PRIVATEUSEONE(mse_loss, fp32)
@@ -480,6 +481,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("coop_caps", [] { return vkt::coop_caps(); });
   m.def("set_coop_enabled", [](bool on) { vkt::set_coop_enabled(on); });
+  m.def("set_fused_attention", [](int mode) { vkt::set_fused_attention(mode); });
   m.def("set_coop_range", [](uint64_t lo, uint64_t hi, int kind) { vkt::set_coop_range(lo, hi, kind); });
   m.def("reset_coop_calls", [] { vkt::reset_coop_calls(); });
   m.def("coop_calls", [] { return vkt::coop_calls(); });

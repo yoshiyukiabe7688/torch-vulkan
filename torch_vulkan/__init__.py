@@ -81,6 +81,12 @@ def set_memory_limit(megabytes: int) -> None:
     _C.set_memory_limit(int(megabytes) << 20)
 
 
+def set_fused_attention(mode: str) -> None:
+    """融合アテンション（F.scaled_dot_product_attention の vk 実装）の方針。"auto"（既定）/ "on" / "off"。
+    auto は、協調行列が使えるときと、score 行列が大きい（256 MiB 以上）ときに使う。環境変数 VKT_FUSED_ATTN=0/1 でも指定できる。"""
+    _C.set_fused_attention({"off": 0, "on": 1, "auto": 2}[mode])
+
+
 def kernel_counts() -> dict:
     return dict(_C.kernel_counts())
 
