@@ -215,6 +215,11 @@ def _register():
         "device",
         "get_rng_state",
         "set_rng_state",
+        # sd-scripts の --vram_budget_mb が torch.vk 経由で使う（auto の予算取得と、数値指定時の上限の強制）
+        "memory_info",
+        "set_memory_limit",
+        "peak_live_bytes",
+        "reset_peak_live_bytes",
     ):
         setattr(module, name, globals()[name])
     torch._register_device_module("vk", module)

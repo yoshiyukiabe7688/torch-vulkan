@@ -648,7 +648,16 @@ impl Runtime {
         } else if let Some(a) = self.carve(rounded) {
             a
         } else {
-            let slab_bytes = self.slab_bytes;
+            let mut slab_bytes = self.slab_bytes;
+            if self.mem_limit > 0 {
+                // 上限の残りが通常のスラブより小さくても、要求が収まるなら残りいっぱいまでの小さいスラブを作る
+                // （境界で 1 スラブ分の余白が足りず、実際には空きがあるのに確保に失敗するのを避ける）
+                let head = self.mem_limit.saturating_sub(self.reserved_bytes());
+                let head = head - head % 256;
+                if head >= rounded {
+                    slab_bytes = slab_bytes.min(head);
+                }
+            }
             self.new_slab_with_retry(slab_bytes, false)?;
             self.carve(rounded).ok_or("スラブ作成直後の割り当てに失敗")?
         };
