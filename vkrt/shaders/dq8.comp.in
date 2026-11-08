@@ -1,0 +1,63 @@
+// 重みのみ INT8 の dequant: out[r, c] = float(q[r, c]) * float(scale[r, c / 64])（KIND = out の dtype。計算は fp32）。
+// q: int8 [rows, cols] 連続、scale: bf16 [rows, ceil(cols / 64)] 連続（各行を 64 要素ずつのブロックに分ける）。
+// 1 スレッドが連続 4 要素を処理する（q を i8vec4 で 1 回読む）。ディスパッチは 2 次元（idx 規約は im2col.comp.in と同じ）。
+//   flags bit0: cols が 64 の倍数 -> scale の添字は e / 64（除算なし）。bit1: total が 4 の倍数 -> i8vec4 で読める。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#include "types.glsl"
+
+layout(buffer_reference, scalar, buffer_reference_align = 1) buffer RI8 { int8_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) buffer RI8x4 { i8vec4 v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer RSC { uint16_t v[]; };
+
+layout(push_constant, scalar) uniform P {
+    uint64_t q;
+    uint64_t scale;
+    uint64_t out_;
+    uint total;
+    uint cols;
+    uint nblocks;
+    uint flags;
+} p;  // 合計 40 バイト
+
+layout(local_size_x = 256) in;
+
+float ldScale(uint e) {
+    uint si;
+    if ((p.flags & 1u) != 0u) {
+        si = e >> 6;
+    } else {
+        uint row = e / p.cols;
+        uint col = e - row * p.cols;
+        si = row * p.nblocks + (col >> 6);
+    }
+    return bf2f(RSC(p.scale).v[si]);
+}
+
+void main() {
+    uint g = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    uint e0 = g * 4u;
+    if (e0 >= p.total) return;
+    if ((p.flags & 2u) != 0u) {
+        i8vec4 qv = RI8x4(p.q).v[g];
+        if ((p.flags & 1u) != 0u) {
+            float s = ldScale(e0);  // 64 の倍数の cols では 4 要素が同じブロックに入る
+            stK(p.out_, e0, float(qv.x) * s);
+            stK(p.out_, e0 + 1u, float(qv.y) * s);
+            stK(p.out_, e0 + 2u, float(qv.z) * s);
+            stK(p.out_, e0 + 3u, float(qv.w) * s);
+        } else {
+            stK(p.out_, e0, float(qv.x) * ldScale(e0));
+            stK(p.out_, e0 + 1u, float(qv.y) * ldScale(e0 + 1u));
+            stK(p.out_, e0 + 2u, float(qv.z) * ldScale(e0 + 2u));
+            stK(p.out_, e0 + 3u, float(qv.w) * ldScale(e0 + 3u));
+        }
+    } else {
+        for (uint k = 0u; k < 4u; ++k) {
+            uint e = e0 + k;
+            if (e < p.total) stK(p.out_, e, float(RI8(p.q).v[e]) * ldScale(e));
+        }
+    }
+}

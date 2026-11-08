@@ -44,6 +44,9 @@ std::optional<at::Tensor> conv_forward_gpu(const at::Tensor& input, const at::Te
                                            const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                                            const std::vector<int64_t>& dilation, bool transposed, int64_t groups);
 
+// 重みのみ INT8 の dequant（ops_quant.cpp）。q: int8 [rows, cols]、scale: bf16 [rows, ceil(cols/64)]（64 要素ブロック）。
+at::Tensor dequant_int8_vk(const at::Tensor& q, const at::Tensor& scale, at::ScalarType out_dtype);
+
 // カーネル名 -> 番号（キャッシュ付き）。無ければ例外。
 int kernel_index(const std::string& name);
 
