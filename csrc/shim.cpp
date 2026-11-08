@@ -416,6 +416,10 @@ TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
 // ---- Python バインディング ----------------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("init", [] { ensure_init(); });
+  m.def("dequant_int8", [](const at::Tensor& q, const at::Tensor& scale, at::ScalarType out_dtype) {
+    ensure_init();
+    return dequant_int8_vk(q, scale, out_dtype);
+  });
   m.def("device_name", [] {
     ensure_init();
     char buf[256];

@@ -184,6 +184,21 @@ def set_coop_enabled(on: bool) -> None:
     _C.set_coop_enabled(bool(on))
 
 
+def dequant_int8(q, scale, out_dtype=torch.bfloat16):
+    """重みのみ INT8 の dequant: out[r, c] = float(q[r, c]) * float(scale[r, c // 64]) を out_dtype に丸める。
+
+    q: int8 [rows, cols]、scale: bfloat16 [rows, ceil(cols / 64)]（各行を 64 要素ずつのブロックに分ける）。
+    vk 上なら GPU カーネル（dq8）、それ以外は同じ式の純 PyTorch（基準実装）。
+    """
+    if q.device.type == "vk":
+        q = q if q.is_contiguous() else q.contiguous()
+        scale = scale if scale.is_contiguous() else scale.contiguous()
+        return _C.dequant_int8(q, scale, out_dtype)
+    cols = q.shape[1]
+    s = scale.float().repeat_interleave(64, dim=1)[:, :cols]
+    return (q.float() * s).to(out_dtype)
+
+
 def fallback_counts() -> dict:
     return dict(_C.fallback_counts())
 

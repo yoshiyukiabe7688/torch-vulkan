@@ -34,6 +34,7 @@ ROW_KERNELS = [
     ("gn.comp.in", "gn_fwd", 0, 88),
     ("gn.comp.in", "gn_bwd", 1, 88),
     ("gn.comp.in", "gn_wgrad", 2, 88),
+    ("dq8.comp.in", "dq8", 0, 40),
 ]
 
 KIND = {"f32": 0, "bf16": 1, "f16": 2, "u8": 3}
