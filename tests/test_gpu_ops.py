@@ -21,7 +21,7 @@ def _reset():
 
 
 def test_runs_on_real_gpu():
-    assert "Radeon" in torch_vulkan.device_name() or "AMD" in torch_vulkan.device_name()
+    assert any(v in torch_vulkan.device_name() for v in ("Radeon", "AMD", "Intel", "NVIDIA", "GeForce"))  # CPU 実装（llvmpipe 等）ではないこと
 
 
 def test_roundtrip_dtypes():

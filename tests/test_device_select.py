@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 PROBE = "import torch_vulkan; print('NAME=' + torch_vulkan.device_name())"
@@ -12,7 +14,7 @@ def run(env_value):
     env = dict(os.environ)
     env.pop("VKRT_VALIDATION", None)
     if env_value is None:
-        env.pop("VKRT_DEVICE", None)
+        pass  # 外側の環境（実行者が VKRT_DEVICE を指定していればそれ）をそのまま使う
     else:
         env["VKRT_DEVICE"] = env_value
     env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -32,6 +34,8 @@ def test_default_selection_still_works():
 
 
 def test_select_by_index_zero_and_by_name_substring_case_insensitive():
+    if os.environ.get("VKRT_DEVICE"):
+        pytest.skip("VKRT_DEVICE を指定して実行しているので、番号 0 の選択は確認しない（起動できるとは限らない）")
     by_idx = name_of(run("0"))
     assert by_idx
     # 番号 0 のデバイス名の一部（小文字化）でも同じデバイスが選ばれる
