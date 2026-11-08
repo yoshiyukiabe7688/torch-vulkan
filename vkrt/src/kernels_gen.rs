@@ -291,4 +291,13 @@ pub const GEN_KERNELS: &[(&str, &[u8], u32)] = &[
     ("reduce_f32", include_bytes!("../shaders/gen/reduce_f32.spv"), 80),
     ("reduce_bf16", include_bytes!("../shaders/gen/reduce_bf16.spv"), 80),
     ("reduce_f16", include_bytes!("../shaders/gen/reduce_f16.spv"), 80),
+    ("gn_fwd_f32", include_bytes!("../shaders/gen/gn_fwd_f32.spv"), 88),
+    ("gn_fwd_bf16", include_bytes!("../shaders/gen/gn_fwd_bf16.spv"), 88),
+    ("gn_fwd_f16", include_bytes!("../shaders/gen/gn_fwd_f16.spv"), 88),
+    ("gn_bwd_f32", include_bytes!("../shaders/gen/gn_bwd_f32.spv"), 88),
+    ("gn_bwd_bf16", include_bytes!("../shaders/gen/gn_bwd_bf16.spv"), 88),
+    ("gn_bwd_f16", include_bytes!("../shaders/gen/gn_bwd_f16.spv"), 88),
+    ("gn_wgrad_f32", include_bytes!("../shaders/gen/gn_wgrad_f32.spv"), 88),
+    ("gn_wgrad_bf16", include_bytes!("../shaders/gen/gn_wgrad_bf16.spv"), 88),
+    ("gn_wgrad_f16", include_bytes!("../shaders/gen/gn_wgrad_f16.spv"), 88),
 ];

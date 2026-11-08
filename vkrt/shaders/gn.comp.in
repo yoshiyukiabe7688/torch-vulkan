@@ -1,0 +1,123 @@
+// group_norm の forward / backward。入力は連続な NCHW として [N, C, HW] と見なす。グループ g (n, g) の要素は連続領域
+// [(n*G+g)*M, +M)（M = (C/G)*HW）で、チャネルは c = g*Cg + (i / HW)。計算は fp32、mean / rstd は入力と同じ dtype で保存する（PyTorch CPU と同じ）。
+// MODE 0: y = (x - mean) * rstd * w[c] + b[c]。ワークグループ 1 つが 1 つの (n, g)。mean / rstd を p.mean / p.rstd へ書く。
+// MODE 1: dx = rstd * (dy*w - mean(dy*w) - xhat * mean(dy*w*xhat))。ワークグループ 1 つが 1 つの (n, g)。出力 dx -> p.y。
+// MODE 2: dw[c] = sum(dy * xhat)、db[c] = sum(dy)（N, HW 方向）。ワークグループ 1 つが 1 つのチャネル c。出力 -> p.y (dw) / p.b (db)。0 なら書かない。
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(push_constant, scalar) uniform P {
+    uint64_t x;
+    uint64_t y;
+    uint64_t g;     // MODE 1, 2: grad_out
+    uint64_t mean;  // [N, G]
+    uint64_t rstd;  // [N, G]
+    uint64_t w;     // [C]（無ければ 0）
+    uint64_t b;     // MODE 0: bias [C]（無ければ 0）/ MODE 2: 出力 db
+    uint M;         // グループあたりの要素数 (C/G)*HW
+    uint HW;
+    uint Cg;        // C / G
+    uint G;
+    uint C;
+    uint N;
+    float eps;
+    uint pad;
+} p;  // 合計 88 バイト
+
+// ワークグループのスレッド数。SD の実形は (n, g) が 32 個程度で並列度が低いので、1024 にすると 256 の約 2.3 倍速い（RX 9070 XT、
+// [1,320,64,64] の fwd 0.119 → 0.052 ms）。デバイスが maxComputeWorkGroupInvocations >= 1024 を持つこと（RDNA / Polaris / Arc は 1024）。
+#ifndef GN_T
+#define GN_T 1024
+#endif
+layout(local_size_x = GN_T) in;
+
+// GN_T スレッドのワークグループ内リダクション（types.glsl の block_sum は 256 固定なので、ここで定義する）
+shared float gn_red[GN_T];
+float gn_sum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    gn_red[t] = v;
+    barrier();
+    for (uint s = GN_T / 2u; s > 0u; s >>= 1) {
+        if (t < s) gn_red[t] += gn_red[t + s];
+        barrier();
+    }
+    float r = gn_red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#if MODE == 2
+    uint c = gl_WorkGroupID.x;
+    uint grp = c / p.Cg;
+    float sw = 0.0;
+    float sb = 0.0;
+    for (uint n = 0u; n < p.N; ++n) {
+        uint gi = n * p.G + grp;
+        float mu = ldK(p.mean, gi);
+        float rs = ldK(p.rstd, gi);
+        uint base = (n * p.C + c) * p.HW;
+        for (uint i = t; i < p.HW; i += GN_T) {
+            float dy = ldK(p.g, base + i);
+            sw += dy * (ldK(p.x, base + i) - mu) * rs;
+            sb += dy;
+        }
+    }
+    sw = gn_sum(sw);
+    sb = gn_sum(sb);
+    if (t == 0u) {
+        if (p.y != uint64_t(0)) stK(p.y, c, sw);
+        if (p.b != uint64_t(0)) stK(p.b, c, sb);
+    }
+#else
+    uint grp_idx = gl_WorkGroupID.x;         // n * G + g
+    uint g = grp_idx % p.G;
+    uint base = grp_idx * p.M;
+    uint c0 = g * p.Cg;
+#if MODE == 0
+    float s = 0.0;
+    for (uint i = t; i < p.M; i += GN_T) s += ldK(p.x, base + i);
+    float mu = gn_sum(s) / float(p.M);
+    float v = 0.0;
+    for (uint i = t; i < p.M; i += GN_T) {
+        float d = ldK(p.x, base + i) - mu;
+        v += d * d;
+    }
+    float rs = inversesqrt(gn_sum(v) / float(p.M) + p.eps);
+    if (t == 0u) {
+        stK(p.mean, grp_idx, mu);
+        stK(p.rstd, grp_idx, rs);
+    }
+    for (uint i = t; i < p.M; i += GN_T) {
+        uint c = c0 + i / p.HW;
+        float a = rs;
+        float bb = 0.0;
+        if (p.w != uint64_t(0)) a *= ldK(p.w, c);
+        if (p.b != uint64_t(0)) bb = ldK(p.b, c);
+        // (x - mean) を先に引く。x*a + (-mean*a) の形だと、平均が分散に比べて大きいときに桁落ちする
+        stK(p.y, base + i, (ldK(p.x, base + i) - mu) * a + bb);
+    }
+#else
+    float mu = ldK(p.mean, grp_idx);
+    float rs = ldK(p.rstd, grp_idx);
+    float s1 = 0.0;
+    float s2 = 0.0;
+    for (uint i = t; i < p.M; i += GN_T) {
+        float dyw = ldK(p.g, base + i);
+        if (p.w != uint64_t(0)) dyw *= ldK(p.w, c0 + i / p.HW);
+        s1 += dyw;
+        s2 += dyw * (ldK(p.x, base + i) - mu) * rs;
+    }
+    s1 = gn_sum(s1) / float(p.M);
+    s2 = gn_sum(s2) / float(p.M);
+    for (uint i = t; i < p.M; i += GN_T) {
+        float dyw = ldK(p.g, base + i);
+        if (p.w != uint64_t(0)) dyw *= ldK(p.w, c0 + i / p.HW);
+        float xh = (ldK(p.x, base + i) - mu) * rs;
+        stK(p.y, base + i, rs * (dyw - s1 - xh * s2));
+    }
+#endif
+#endif
+}
