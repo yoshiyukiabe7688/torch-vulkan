@@ -202,6 +202,7 @@ at::Tensor k_baddbmm(const at::Tensor& self, const at::Tensor& a, const at::Tens
 
 namespace vkt {
 void set_coop_enabled(bool on) { coop_enabled().store(on); }
+bool coop_is_enabled() { return coop_enabled().load(); }
 uint32_t coop_caps() { return coop_caps_cached(); }
 void set_coop_range(uint64_t lo, uint64_t hi, int kind) {
   g_coop_lo.store(lo);

@@ -35,6 +35,10 @@ ROW_KERNELS = [
     ("gn.comp.in", "gn_bwd", 1, 88),
     ("gn.comp.in", "gn_wgrad", 2, 88),
     ("dq8.comp.in", "dq8", 0, 40),
+    ("attn.comp.in", "attn_fwd", 0, 128),
+    ("attn.comp.in", "attn_dkdv", 1, 128),
+    ("attn.comp.in", "attn_dq", 2, 128),
+    ("attn.comp.in", "attn_delta", 3, 128),
 ]
 
 KIND = {"f32": 0, "bf16": 1, "f16": 2, "u8": 3}
@@ -161,6 +165,9 @@ def main():
         entries.append((compile_mm(dt), MM_PUSH_SIZE))
     for dt in ("bf16", "f16"):  # 協調行列版（vkrt が対応を判定し、非対応デバイスでは使われない）
         entries.append((compile_mm(dt, coop=True), MM_PUSH_SIZE))
+    for mode, nm in ((0, "fwd"), (1, "dkdv"), (2, "dq")):  # 融合アテンションの協調行列版（bf16 / f16 のみ）
+        for dt in ("bf16", "f16"):
+            entries.append((compile_row("attn_coop.comp.in", f"attn_coop_{nm}", mode, dt), 104))
     for template, prefix, mode, size in ROW_KERNELS:
         for dt in FLOATS:
             entries.append((compile_row(template, prefix, mode, dt), size))
