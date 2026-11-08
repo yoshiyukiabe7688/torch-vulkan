@@ -276,6 +276,12 @@ impl Runtime {
                     props.limits.max_push_constants_size
                 ));
             }
+            if props.limits.max_compute_work_group_invocations < 1024 {
+                return Err(format!(
+                    "maxComputeWorkGroupInvocations={} が必要量 1024 に足りません（GroupNorm カーネルが 1024 スレッドを使う）",
+                    props.limits.max_compute_work_group_invocations
+                ));
+            }
             let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut m3);
             instance.get_physical_device_properties2(pd, &mut p2);

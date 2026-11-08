@@ -357,6 +357,15 @@ const at::Tensor& wrapper_resize_(
 at::Tensor k_convolution_overrideable(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
                                       c10::SymIntArrayRef stride, c10::SymIntArrayRef padding, c10::SymIntArrayRef dilation, bool transposed,
                                       c10::SymIntArrayRef output_padding, c10::SymInt groups) {
+  {
+    auto ints = [](c10::SymIntArrayRef a) {
+      std::vector<int64_t> v;
+      for (const auto& s : a) v.push_back(s.guard_int(__FILE__, __LINE__));
+      return v;
+    };
+    if (auto r = conv_forward_gpu(input, weight, bias, ints(stride), ints(padding), ints(dilation), transposed, groups.guard_int(__FILE__, __LINE__)))
+      return *r;
+  }
   count_fallback("aten::convolution_overrideable");
   std::optional<at::Tensor> b = std::nullopt;
   if (bias.has_value() && bias->defined()) b = bias->to(at::kCPU);
@@ -396,6 +405,9 @@ TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
   KERNEL_PRIVATEUSEONE(addmm, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(baddbmm, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(matmul, lower_precision_fp)
+  KERNEL_PRIVATEUSEONE(conv1d, lower_precision_fp)
+  KERNEL_PRIVATEUSEONE(conv2d, lower_precision_fp)
+  KERNEL_PRIVATEUSEONE(conv3d, lower_precision_fp)
   KERNEL_PRIVATEUSEONE(layer_norm, fp32)
   KERNEL_PRIVATEUSEONE(softmax, int, fp32)
   KERNEL_PRIVATEUSEONE(mse_loss, fp32)

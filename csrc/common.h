@@ -5,7 +5,9 @@
 #include <ATen/native/CPUFallback.h>
 #include <torch/library.h>
 
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "vkrt.h"
 
@@ -36,6 +38,11 @@ uint32_t coop_caps();
 void set_coop_range(uint64_t lo, uint64_t hi, int kind);
 void reset_coop_calls();
 uint64_t coop_calls();
+
+// conv2d の forward を GPU（im2col + mm）で実行する（ops_conv.cpp）。対応しない形なら nullopt。
+std::optional<at::Tensor> conv_forward_gpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+                                           const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                                           const std::vector<int64_t>& dilation, bool transposed, int64_t groups);
 
 // カーネル名 -> 番号（キャッシュ付き）。無ければ例外。
 int kernel_index(const std::string& name);
