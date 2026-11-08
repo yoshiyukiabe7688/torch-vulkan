@@ -366,3 +366,16 @@ def test_fast_path_handles_scalar_broadcast_and_noncontiguous_inputs_via_general
     s = torch.tensor(1.5).to(dev)
     close(xd * s, x * 1.5)  # 0 次元（vk 上）
     no_fallback("aten::mul", "aten::add")
+
+
+def test_four_dims_max_on_gpu_and_five_dims_fall_back_to_cpu_correctly():
+    # push constant を 128 バイトに収めるため、次元結合後の GPU 経路は 4 次元まで。
+    # 4 次元（ブロードキャストで 4 つに分かれる）は GPU、5 次元は CPU フォールバックで、どちらも CPU の結果と一致すること。
+    a4, b4 = rnd((2, 3, 1, 5), seed=1), rnd((1, 3, 4, 1), seed=2)
+    a5, b5 = rnd((2, 3, 1, 4, 5), seed=3), rnd((1, 3, 2, 1, 5), seed=4)
+    close(a4.to(dev) + b4.to(dev), a4 + b4)
+    no_fallback("aten::add")
+    out5 = a5.to(dev) * b5.to(dev)
+    assert out5.device.type == "vk"
+    close(out5, a5 * b5)
+    close(a5.to(dev) + b5.to(dev), a5 + b5)

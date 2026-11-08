@@ -53,14 +53,14 @@ layout(push_constant, scalar) uniform P {
     uint64_t c;
     uint n;
     uint pad;
-    uint sz[5];
-    uint so[5];
-    uint sa[5];
-    uint sb[5];
-    uint sc[5];
+    uint sz[4];
+    uint so[4];
+    uint sa[4];
+    uint sb[4];
+    uint sc[4];
     float s0;
     float s1;
-} p;  // 合計 152 バイト
+} p;  // 合計 128 バイト（maxPushConstantsSize の Vulkan 保証最小値。Windows の AMD ドライバは 128 を報告する）
 
 layout(local_size_x = 256) in;
 
@@ -193,7 +193,7 @@ float gelu_tanh_bwd(float g, float x) {
 
 #ifdef FAST1D
 // 次元結合後に 1 次元になった場合の高速経路（連続メモリの 2 項演算など、学習で最も多い形）。
-// 一般経路は 1 要素ごとに 5 次元分の整数除算・剰余をするため、除算の遅い GPU(Polaris など)で ALU 律速になり、
+// 一般経路は 1 要素ごとに 4 次元分の整数除算・剰余をするため、除算の遅い GPU(Polaris など)で ALU 律速になり、
 // メモリ帯域のピークの 1 割程度しか使えなかった（RX 550 で実測 12GB/s / 112GB/s）。
 // ここでは除算を使わず、1 スレッドが 4 要素を（スレッド間でコアレスするよう間隔を空けて）処理して ILP を稼ぐ。
 void main() {
@@ -209,13 +209,13 @@ void main() {
         xs[k] = 0.0; ys[k] = 0.0; zs[k] = 0.0;
         if (i < p.n) {
 #ifdef HAS_A
-            xs[k] = ldA(i * p.sa[4]);
+            xs[k] = ldA(i * p.sa[3]);
 #endif
 #ifdef HAS_B
-            ys[k] = ldB(i * p.sb[4]);
+            ys[k] = ldB(i * p.sb[3]);
 #endif
 #ifdef HAS_C
-            zs[k] = ldC(i * p.sc[4]);
+            zs[k] = ldC(i * p.sc[3]);
 #endif
         }
     }
@@ -226,7 +226,7 @@ void main() {
             float y = ys[k];
             float z = zs[k];
             float r = OP_EXPR;
-            stO(i * p.so[4], r);
+            stO(i * p.so[3], r);
         }
     }
 }
@@ -236,7 +236,7 @@ void main() {
     if (i >= p.n) return;
     uint rem = i;
     uint oo = 0u, oa = 0u, ob = 0u, oc = 0u;
-    for (int d = 4; d >= 0; --d) {
+    for (int d = 3; d >= 0; --d) {
         uint idx = rem % p.sz[d];
         rem /= p.sz[d];
         oo += idx * p.so[d];

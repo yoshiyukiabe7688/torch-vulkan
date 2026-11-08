@@ -1,6 +1,6 @@
 // 要素演算の ATen 登録。カーネル本体は vkrt/shaders/ew.comp.in（tools/gen_shaders.py が展開）。
 // 方針: 条件を満たすときだけ GPU カーネルで実行し、満たさなければ std::nullopt を返して CPU フォールバックに戻す。
-//   GPU 経路の条件: テンソルが vk 上・dtype が f32/bf16/f16（bool は copy / where の条件のみ）・次元結合後 5 次元以下。
+//   GPU 経路の条件: テンソルが vk 上・dtype が f32/bf16/f16（bool は copy / where の条件のみ）・次元結合後 4 次元以下。
 #include <ATen/Operators.h>
 #include <ATen/ExpandUtils.h>
 
@@ -18,14 +18,14 @@ namespace {
 using namespace vkt;
 using IntVec = std::vector<int64_t>;
 
-// ew.comp.in の push constant ブロックと同一レイアウト（152 バイト）
+// ew.comp.in の push constant ブロックと同一レイアウト（128 バイト）
 struct EwPush {
   uint64_t out, a, b, c;
   uint32_t n, pad;
-  uint32_t sz[5], so[5], sa[5], sb[5], sc[5];
+  uint32_t sz[4], so[4], sa[4], sb[4], sc[4];
   float s0, s1;
 };
-static_assert(sizeof(EwPush) == 152, "EwPush は ew.comp.in の push constant と同じ 152 バイトであること");
+static_assert(sizeof(EwPush) == 128, "EwPush は ew.comp.in の push constant と同じ 128 バイトであること");
 
 const char* kind_name(at::ScalarType t) {
   switch (t) {
@@ -72,7 +72,7 @@ IntVec contiguous_strides(const IntVec& sizes) {
   return st;
 }
 
-// 次元を結合（隣接次元の stride が連続なら 1 本にする）して 5 次元に収める。
+// 次元を結合（隣接次元の stride が連続なら 1 本にする）して 4 次元に収める（push constant を 128 バイトに収めるため）。5 次元以上が残る入力は呼び出し側が CPU フォールバックする。
 bool ew_prepare(EwPush& P, const IntVec& sizes, const IntVec& out_strides, const at::Tensor* a, const at::Tensor* b,
                 const at::Tensor* c) {
   const at::Tensor* ops[3] = {a, b, c};
@@ -109,12 +109,12 @@ bool ew_prepare(EwPush& P, const IntVec& sizes, const IntVec& out_strides, const
     }
     merged.push_back(d);
   }
-  if (merged.size() > 5) return false;
+  if (merged.size() > 4) return false;
 
   P = EwPush{};
   P.n = (uint32_t)numel;
-  for (int i = 0; i < 5; ++i) P.sz[i] = 1;
-  int base = 5 - (int)merged.size();
+  for (int i = 0; i < 4; ++i) P.sz[i] = 1;
+  int base = 4 - (int)merged.size();
   for (size_t j = 0; j < merged.size(); ++j) {
     for (int k = 0; k < 4; ++k) {
       if (merged[j].stride[k] > (int64_t)UINT32_MAX) return false;
@@ -137,7 +137,7 @@ void ew_run(const std::string& kernel, const char* aten_name, EwPush& P, const a
   P.s0 = s0;
   P.s1 = s1;
   // 次元結合後に 1 次元なら、除算を使わない高速経路（ew1_*、1 スレッド 4 要素）
-  bool fast = P.sz[0] == 1 && P.sz[1] == 1 && P.sz[2] == 1 && P.sz[3] == 1;
+  bool fast = P.sz[0] == 1 && P.sz[1] == 1 && P.sz[2] == 1;
   std::string kname = fast ? "ew1_" + kernel.substr(3) : kernel;
   uint32_t groups = fast ? (P.n + 1023) / 1024 : (P.n + 255) / 256;
   vk_check(vkrt_dispatch((uint32_t)kernel_index(kname), &P, sizeof(P), groups, 1, 1), kernel.c_str());
