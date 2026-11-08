@@ -231,12 +231,42 @@ impl Runtime {
             }
 
             let pds = instance.enumerate_physical_devices().map_err(vkerr("物理デバイス列挙"))?;
-            let pd = pds
+            let names: Vec<String> = pds
                 .iter()
-                .copied()
-                .find(|&p| instance.get_physical_device_properties(p).device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
-                .or(pds.first().copied())
-                .ok_or("Vulkan デバイスが見つかりません")?;
+                .map(|&p| {
+                    let pr = instance.get_physical_device_properties(p);
+                    pr.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                })
+                .collect();
+            let pd = match std::env::var("VKRT_DEVICE") {
+                // 明示選択: 番号、または名前の部分一致（大文字小文字を無視。複数一致したら番号の小さい方）
+                Ok(sel) if !sel.trim().is_empty() => {
+                    let sel = sel.trim();
+                    let idx = match sel.parse::<usize>() {
+                        Ok(i) => (i < pds.len()).then_some(i),
+                        Err(_) => {
+                            let key = sel.to_lowercase();
+                            names.iter().position(|n| n.to_lowercase().contains(&key))
+                        }
+                    };
+                    match idx {
+                        Some(i) => pds[i],
+                        None => {
+                            let list: Vec<String> = names.iter().enumerate().map(|(i, n)| format!("{i}: {n}")).collect();
+                            return Err(format!(
+                                "VKRT_DEVICE={sel} に一致する Vulkan デバイスがありません（利用可能: {}）",
+                                list.join(", ")
+                            ));
+                        }
+                    }
+                }
+                _ => pds
+                    .iter()
+                    .copied()
+                    .find(|&p| instance.get_physical_device_properties(p).device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
+                    .or(pds.first().copied())
+                    .ok_or("Vulkan デバイスが見つかりません")?,
+            };
             let props = instance.get_physical_device_properties(pd);
             let device_name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
@@ -303,9 +333,36 @@ impl Runtime {
                 let mut pp = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
                 instance.get_physical_device_properties2(pd, &mut pp);
             }
+            // 協調行列カーネルが使う形（subgroup スコープ、16x16x16、f16 または bf16 の A/B、f32 の C/結果）をデバイスが持つか。
+            // 機能ビットだけでは足りない（Intel Arc 140V は協調行列に対応するが 16x16 の f32 アキュムレータが無く、
+            // 無効な形のパイプラインを作ってしまう）。
+            let (shape_f16, shape_bf16) = if has_ext(ext_coop) {
+                let ci = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                match ci.get_physical_device_cooperative_matrix_properties(pd) {
+                    Ok(v) => {
+                        let bf16_type = vk::ComponentTypeKHR::from_raw(1000141000); // VK_COMPONENT_TYPE_BFLOAT16_KHR
+                        let base = |p: &vk::CooperativeMatrixPropertiesKHR| {
+                            p.scope == vk::ScopeKHR::SUBGROUP
+                                && p.m_size == 16
+                                && p.n_size == 16
+                                && p.k_size == 16
+                                && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                                && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                        };
+                        (
+                            v.iter().any(|p| base(p) && p.a_type == vk::ComponentTypeKHR::FLOAT16 && p.b_type == vk::ComponentTypeKHR::FLOAT16),
+                            v.iter().any(|p| base(p) && p.a_type == bf16_type && p.b_type == bf16_type),
+                        )
+                    }
+                    Err(_) => (false, false),
+                }
+            } else {
+                (false, false)
+            };
             let coop_ok = !mask_coop
                 && fp16_ok  // 協調行列カーネル(bf16 版も)は Float16 capability を宣言する
                 && has_ext(ext_coop)
+                && shape_f16
                 && q_coop.cooperative_matrix != 0
                 && q13.subgroup_size_control != 0
                 && q12.vulkan_memory_model != 0
@@ -313,7 +370,7 @@ impl Runtime {
                 && sg.min_subgroup_size <= COOP_SUBGROUP
                 && sg.max_subgroup_size >= COOP_SUBGROUP
                 && sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
-            let bf16_ok = coop_ok && has_ext(ext_bf16) && q_bf.shader_bfloat16_type != 0 && q_bf.shader_bfloat16_cooperative_matrix != 0;
+            let bf16_ok = coop_ok && shape_bf16 && has_ext(ext_bf16) && q_bf.shader_bfloat16_type != 0 && q_bf.shader_bfloat16_cooperative_matrix != 0;
                         let coop_caps: u32 = if coop_ok { 1 | if bf16_ok { 2 } else { 0 } } else { 0 };
             let mut dev_ext_ptrs: Vec<*const c_char> = vec![];
             let has_budget = has_ext(ext_budget);
